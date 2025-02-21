@@ -2464,7 +2464,7 @@ static bool pass_output_target(struct pass_state *pass)
     if (lut_type == PL_LUT_NATIVE) {
         pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
         pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
-        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_PREMULTIPLIED);
+        pl_shader_set_alpha(sh, &img->repr, target->repr.alpha);
     }
 
     // Rotation handling
@@ -2546,6 +2546,9 @@ static bool pass_output_target(struct pass_state *pass)
                     continue;
                 src.component_mask |= 1 << plane->component_mapping[c];
             }
+
+            if (params->blend_params) /* preserve alpha if blending */
+                src.component_mask |= 1 << PL_CHANNEL_A;
 
             sh = pl_dispatch_begin(rr->dp);
             dispatch_sampler(pass, sh, &rr->samplers_dst[p], SAMPLER_PLANE,
