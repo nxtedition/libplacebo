@@ -65,10 +65,10 @@ static const struct vk_fun vk_inst_funs[] = {
     PL_VK_INST_FUN(GetDeviceProcAddr),
     PL_VK_INST_FUN(GetPhysicalDeviceExternalBufferProperties),
     PL_VK_INST_FUN(GetPhysicalDeviceExternalSemaphoreProperties),
-    PL_VK_INST_FUN(GetPhysicalDeviceFeatures2KHR),
+    PL_VK_INST_FUN(GetPhysicalDeviceFeatures2),
     PL_VK_INST_FUN(GetPhysicalDeviceFormatProperties),
-    PL_VK_INST_FUN(GetPhysicalDeviceFormatProperties2KHR),
-    PL_VK_INST_FUN(GetPhysicalDeviceImageFormatProperties2KHR),
+    PL_VK_INST_FUN(GetPhysicalDeviceFormatProperties2),
+    PL_VK_INST_FUN(GetPhysicalDeviceImageFormatProperties2),
     PL_VK_INST_FUN(GetPhysicalDeviceMemoryProperties),
     PL_VK_INST_FUN(GetPhysicalDeviceProperties),
     PL_VK_INST_FUN(GetPhysicalDeviceProperties2),
@@ -346,7 +346,6 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(CreateComputePipelines),
     PL_VK_DEV_FUN(CreateDescriptorPool),
     PL_VK_DEV_FUN(CreateDescriptorSetLayout),
-    PL_VK_DEV_FUN(CreateFence),
     PL_VK_DEV_FUN(CreateFramebuffer),
     PL_VK_DEV_FUN(CreateGraphicsPipelines),
     PL_VK_DEV_FUN(CreateImage),
@@ -364,7 +363,6 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(DestroyDescriptorPool),
     PL_VK_DEV_FUN(DestroyDescriptorSetLayout),
     PL_VK_DEV_FUN(DestroyDevice),
-    PL_VK_DEV_FUN(DestroyFence),
     PL_VK_DEV_FUN(DestroyFramebuffer),
     PL_VK_DEV_FUN(DestroyImage),
     PL_VK_DEV_FUN(DestroyImageView),
@@ -391,11 +389,9 @@ static const struct vk_fun vk_dev_funs[] = {
     PL_VK_DEV_FUN(MapMemory),
     PL_VK_DEV_FUN(QueueSubmit),
     PL_VK_DEV_FUN(QueueWaitIdle),
-    PL_VK_DEV_FUN(ResetFences),
     PL_VK_DEV_FUN(ResetQueryPool),
     PL_VK_DEV_FUN(SetDebugUtilsObjectNameEXT),
     PL_VK_DEV_FUN(UpdateDescriptorSets),
-    PL_VK_DEV_FUN(WaitForFences),
     PL_VK_DEV_FUN(WaitSemaphores),
 };
 
@@ -408,29 +404,6 @@ static void load_vk_fun(struct vk_ctx *vk, const struct vk_fun *fun)
     } else {
         *pfn = vk->GetInstanceProcAddr(vk->inst, fun->name);
     };
-
-    if (!*pfn) {
-        // Some functions get their extension suffix stripped when promoted
-        // to core. As a very simple work-around to this, try loading the
-        // function a second time with the reserved suffixes stripped.
-        static const char *ext_suffixes[] = { "KHR", "EXT" };
-        pl_str fun_name = pl_str0(fun->name);
-        char buf[64];
-
-        for (int i = 0; i < PL_ARRAY_SIZE(ext_suffixes); i++) {
-            if (!pl_str_eatend0(&fun_name, ext_suffixes[i]))
-                continue;
-
-            pl_assert(sizeof(buf) > fun_name.len);
-            snprintf(buf, sizeof(buf), "%.*s", PL_STR_FMT(fun_name));
-            if (fun->device_level) {
-                *pfn = vk->GetDeviceProcAddr(vk->dev, buf);
-            } else {
-                *pfn = vk->GetInstanceProcAddr(vk->inst, buf);
-            }
-            return;
-        }
-    }
 }
 
 // Private struct for pl_vk_inst
@@ -1120,6 +1093,22 @@ static int find_qf(VkQueueFamilyProperties *qfs, int qfnum, VkQueueFlags flags)
     return idx;
 }
 
+static const struct vk_fun *promote_vk_fun(void *parent, const struct vk_fun *f)
+{
+    // Functions get their extension suffix stripped when promoted
+    // to core. Strip the suffixes to query core alias of the function.
+    static const char *const ext_suffixes[] = { "KHR", "EXT" };
+    pl_str fun_name = pl_str0(f->name);
+    for (int i = 0; i < PL_ARRAY_SIZE(ext_suffixes); i++) {
+        if (pl_str_eatend0(&fun_name, ext_suffixes[i])) {
+            struct vk_fun *pf = (struct vk_fun *)pl_memdup_ptr(parent, f);
+            pf->name = pl_strdup0(pf, fun_name);
+            return pf;
+        }
+    }
+    return f;
+}
+
 static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params)
 {
     pl_assert(vk->physd);
@@ -1200,7 +1189,7 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         if (core_ver && vk->api_ver >= core_ver) {
             // Layer is already implicitly enabled by the API version
             for (const struct vk_fun *f = ext->funs; f && f->name; f++)
-                PL_ARRAY_APPEND(tmp, ext_funs,  f);
+                PL_ARRAY_APPEND(tmp, ext_funs, promote_vk_fun(tmp, f));
             continue;
         }
 
@@ -1246,7 +1235,7 @@ static bool device_init(struct vk_ctx *vk, const struct pl_vulkan_params *params
         memset(&out[1], 0, size - sizeof(out[0]));
     }
 
-    vk->GetPhysicalDeviceFeatures2KHR(vk->physd, features_sup);
+    vk->GetPhysicalDeviceFeatures2(vk->physd, features_sup);
 
     // Filter out unsupported features
     for (VkBaseOutStructure *f = (VkBaseOutStructure *) &features; f; f = f->pNext) {
@@ -1629,7 +1618,7 @@ pl_vulkan pl_vulkan_import(pl_log log, const struct pl_vulkan_import_params *par
         uint32_t core_ver = vk_ext_promoted_ver(ext->name);
         if (core_ver && vk->api_ver >= core_ver) {
             for (const struct vk_fun *f = ext->funs; f && f->name; f++)
-                load_vk_fun(vk, f);
+                load_vk_fun(vk, promote_vk_fun(tmp, f));
             continue;
         }
         for (int n = 0; n < params->num_extensions; n++) {

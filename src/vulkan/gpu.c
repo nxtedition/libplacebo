@@ -355,7 +355,7 @@ static pl_handle_caps vk_tex_handle_caps(struct vk_ctx *vk, bool import)
         };
 
         VkResult res;
-        res = vk->GetPhysicalDeviceImageFormatProperties2KHR(vk->physd, &pinfo, &props);
+        res = vk->GetPhysicalDeviceImageFormatProperties2(vk->physd, &pinfo, &props);
         if (res != VK_SUCCESS) {
             PL_DEBUG(vk, "Tex caps for %s (0x%x) unsupported: %s",
                      vk_handle_name(ext_pinfo.handleType),
@@ -386,6 +386,13 @@ static const VkFilter filters[PL_TEX_SAMPLE_MODE_COUNT] = {
 
 static inline struct pl_spirv_version get_spirv_version(const struct vk_ctx *vk)
 {
+    if (vk->api_ver >= VK_API_VERSION_1_4) {
+        return (struct pl_spirv_version) {
+            .env_version = VK_API_VERSION_1_4,
+            .spv_version = PL_SPV_VERSION(1, 6),
+        };
+    }
+
     if (vk->api_ver >= VK_API_VERSION_1_3) {
         const VkPhysicalDeviceMaintenance4Features *device_maintenance4;
         device_maintenance4 = vk_find_struct(&vk->features,
