@@ -467,19 +467,13 @@ int pl_cache_load(pl_cache cache, const uint8_t *data, size_t size)
 
 // File I/O wrappers
 
-#ifdef _WIN32
-#  define DIR_SEP '\\'
-#else
-#  define DIR_SEP '/'
-#endif
-
-void pl_cache_set_dir(void *priv, pl_cache_obj obj)
+void pl_cache_set_file(void *priv, pl_cache_obj obj)
 {
     const char *dir = priv;
     if (!dir || !dir[0])
         return;
 
-    char *path = pl_asprintf(NULL, "%s%c%016"PRIx64, dir, DIR_SEP, obj.key);
+    char *path = pl_asprintf(NULL, "%s%016"PRIx64, dir, obj.key);
     if (!obj.size) {
         remove(path);
         pl_free(path);
@@ -491,7 +485,7 @@ void pl_cache_set_dir(void *priv, pl_cache_obj obj)
     if (fp) {
         pl_free(path);
         fclose(fp);
-        return; // ignore already existing files
+        return; // Ignore already existing files; will be validated on next use
     }
 
     fp = fopen(path, "wb");
@@ -499,48 +493,79 @@ void pl_cache_set_dir(void *priv, pl_cache_obj obj)
     if (!fp)
         return;
 
+    // Generate a single entry cache file
+    const struct cache_header header = {
+        .magic       = CACHE_MAGIC,
+        .version     = CACHE_VERSION,
+        .num_entries = 1,
+    };
+
+    const struct cache_entry entry = {
+        .key  = obj.key,
+        .size = obj.size,
+        .hash = pl_mem_hash(obj.data, obj.size),
+    };
+
+    if (fwrite(&header, sizeof(header), 1, fp) != 1 ||
+        fwrite(&entry,  sizeof(entry),  1, fp) != 1)
+    {
+        fclose(fp);
+        remove(path);
+        return;
+    }
+
     size_t written = fwrite(obj.data, 1, obj.size, fp);
     fclose(fp);
     if (written != obj.size)
         remove(path);
 }
 
-pl_cache_obj pl_cache_get_dir(void *priv, uint64_t key)
+pl_cache_obj pl_cache_get_file(void *priv, uint64_t key)
 {
     const char *dir = priv;
     if (!dir || !dir[0])
         return (pl_cache_obj) {0};
 
-    char *path = pl_asprintf(NULL, "%s%c%016"PRIx64, dir, DIR_SEP, key);
+    char *path = pl_asprintf(NULL, "%s%016"PRIx64, dir, key);
     FILE *fp = fopen(path, "rb");
-    pl_free(path);
-    if (!fp)
+    if (!fp) {
+        pl_free(path);
         return (pl_cache_obj) {0};
+    }
 
-    if (fseek(fp, 0, SEEK_END) != 0)
+    struct cache_header header;
+    struct cache_entry entry;
+    if (fread(&header, sizeof(header), 1, fp) != 1 ||
+        memcmp(header.magic, CACHE_MAGIC, sizeof(header.magic)) ||
+        header.version != CACHE_VERSION || header.num_entries != 1 ||
+        fread(&entry, sizeof(entry), 1, fp) != 1 ||
+        entry.key != key || !entry.size || entry.size > SIZE_MAX)
+    {
+        // Corrupt cache
         goto error;
-    long size = ftell(fp);
-    if (size <= 0)
-        goto error;
-    if (fseek(fp, 0, SEEK_SET) != 0)
-        goto error;
+    }
 
-    char *buffer = pl_alloc(NULL, size);
-    size_t read = fread(buffer, 1, size, fp);
-    if (read != size) {
-        pl_free(buffer);
+    char *data = pl_alloc(NULL, entry.size);
+    if (fread(data, 1, entry.size, fp) != entry.size ||
+        pl_mem_hash(data, entry.size) != entry.hash)
+    {
+        pl_free(data);
         goto error;
     }
 
     fclose(fp);
+    pl_free(path);
     return (pl_cache_obj) {
         .key  = key,
-        .size = size,
-        .data = buffer,
+        .size = entry.size,
+        .data = data,
         .free = pl_free,
     };
 
 error:
+    // Clean up corrupt/invalid cache files by silently removing them
     fclose(fp);
+    remove(path);
+    pl_free(path);
     return (pl_cache_obj) {0};
 }
