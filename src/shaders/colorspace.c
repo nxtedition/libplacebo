@@ -579,9 +579,6 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
         }
     }
 
-    if (repr->alpha == PL_ALPHA_PREMULTIPLIED)
-        GLSL("color.rgb *= vec3(color.a); \n");
-
     GLSL("}\n");
 }
 

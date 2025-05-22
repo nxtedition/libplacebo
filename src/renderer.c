@@ -2427,6 +2427,10 @@ static bool pass_output_target(struct pass_state *pass)
     else if (params->skip_target_clearing)
         background = PL_CLEAR_SKIP;
 
+    /* Avoid unnecessary round trip through premultiplied alpha */
+    if (params->background_transparency >= 1.0)
+        background = PL_CLEAR_SKIP;
+
     bool has_alpha = target->repr.alpha != PL_ALPHA_NONE || params->blend_params;
     bool need_blend = background != PL_CLEAR_SKIP || !has_alpha;
     if (img->comps == 4 && need_blend) {
@@ -2463,9 +2467,10 @@ static bool pass_output_target(struct pass_state *pass)
         case PL_CLEAR_SKIP: break;
         case PL_CLEAR_MODE_COUNT: pl_unreachable();
         }
-    } else if (img->comps == 4 && has_alpha) {
-        pl_shader_set_alpha(sh, &img->repr, target->repr.alpha);
     }
+
+    if (img->comps == 4 && has_alpha)
+        pl_shader_set_alpha(sh, &img->repr, target->repr.alpha);
 
     // Apply the color scale separately, after encoding is done, to make sure
     // that the intermediate FBO (if any) has the correct precision.
