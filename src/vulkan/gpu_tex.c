@@ -302,6 +302,11 @@ pl_tex vk_tex_create(pl_gpu gpu, const struct pl_tex_params *params)
     if (tex->params.host_writable || tex->params.blit_dst || params->initial_data)
         usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
+    // Opportunistically try and use host image copies if possible
+    if ((tex->params.host_readable || tex->params.host_writable ||
+        params->initial_data) && fmtp->can_host_copy)
+        usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+
     if (!usage) {
         // Vulkan requires images have at least *some* image usage set, but our
         // API is perfectly happy with a (useless) image. So just put
@@ -851,6 +856,144 @@ static enum queue_type vk_img_copy_queue(pl_gpu gpu, pl_tex tex,
     }
 }
 
+static bool prepare_host_xfer(pl_gpu gpu, pl_tex tex, bool upload)
+{
+    struct pl_vk *p = PL_PRIV(gpu);
+    struct vk_ctx *vk = p->vk;
+    struct pl_tex_vk *tex_vk = PL_PRIV(tex);
+    const PL_ARRAY(VkImageLayout) *layouts = upload ? (void *) &p->host_ul_layouts
+                                                    : (void *) &p->host_dl_layouts;
+
+    for (int i = 0; i < layouts->num; i++) {
+        if (tex_vk->layout == layouts->elem[i])
+            goto layout_done;
+    }
+
+    // Need to perform a layout transition
+    struct vk_cmd *cmd = CMD_BEGIN(GRAPHICS);
+    if (!cmd)
+        goto error;
+
+    vk_tex_barrier(gpu, cmd, tex, VK_PIPELINE_STAGE_HOST_BIT,
+                   upload ? VK_ACCESS_HOST_WRITE_BIT : VK_ACCESS_HOST_READ_BIT,
+                   VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED);
+
+    if (!CMD_SUBMIT(&cmd))
+        goto error;
+
+layout_done: ;
+
+    const pl_vulkan_sem *sync = upload ? &tex_vk->sem.read.sync
+                                       : &tex_vk->sem.write.sync;
+
+    if (vk_tex_poll(gpu, tex, 0) && sync->sem) {
+        VK(vk->WaitSemaphores(vk->dev, &(VkSemaphoreWaitInfo) {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &sync->sem,
+            .pValues = &sync->value,
+        }, UINT64_MAX));
+
+        // process callbacks
+        vk_poll_commands(vk, 0);
+    }
+
+    for (int i = 0; i < tex_vk->ext_deps.num; i++) {
+        const pl_vulkan_sem *dep = &tex_vk->ext_deps.elem[i];
+        VK(vk->WaitSemaphores(vk->dev, &(VkSemaphoreWaitInfo) {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &dep->sem,
+            .pValues = &dep->value,
+        }, UINT64_MAX));
+    }
+
+    tex_vk->may_invalidate = false;
+    tex_vk->ext_deps.num = 0;
+    return true;
+
+error:
+    return false;
+}
+
+static bool vk_tex_upload_host(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+{
+    struct pl_vk *p = PL_PRIV(gpu);
+    struct vk_ctx *vk = p->vk;
+    pl_rect3d rc = params->rc;
+    pl_tex tex = params->tex;
+    pl_fmt fmt = tex->params.format;
+    struct pl_tex_vk *tex_vk = PL_PRIV(tex);
+
+    if (!prepare_host_xfer(gpu, tex, true))
+        return false;
+
+    VK(vk->CopyMemoryToImageEXT(vk->dev, &(VkCopyMemoryToImageInfo) {
+        .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+        .dstImage = tex_vk->img,
+        .dstImageLayout = tex_vk->layout,
+        .regionCount = 1,
+        .pRegions = &(VkMemoryToImageCopy) {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY,
+            .pHostPointer = params->ptr,
+            .memoryRowLength = params->row_pitch / fmt->texel_size,
+            .memoryImageHeight = params->depth_pitch / params->row_pitch,
+            .imageOffset = { rc.x0, rc.y0, rc.z0 },
+            .imageExtent = { rc.x1, rc.y1, rc.z1 },
+            .imageSubresource = {
+                .aspectMask = tex_vk->aspect,
+                .layerCount = 1,
+            },
+        },
+    }));
+
+    if (params->callback)
+        params->callback(params->priv);
+    return true;
+
+error:
+    return false;
+}
+
+static bool vk_tex_download_host(pl_gpu gpu, const struct pl_tex_transfer_params *params)
+{
+    struct pl_vk *p = PL_PRIV(gpu);
+    struct vk_ctx *vk = p->vk;
+    pl_rect3d rc = params->rc;
+    pl_tex tex = params->tex;
+    pl_fmt fmt = tex->params.format;
+    struct pl_tex_vk *tex_vk = PL_PRIV(tex);
+
+    if (!prepare_host_xfer(gpu, tex, false))
+        return false;
+
+    VK(vk->CopyImageToMemoryEXT(vk->dev, &(VkCopyImageToMemoryInfo) {
+        .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT,
+        .srcImage = tex_vk->img,
+        .srcImageLayout = tex_vk->layout,
+        .regionCount = 1,
+        .pRegions = &(VkImageToMemoryCopy) {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY,
+            .pHostPointer = params->ptr,
+            .memoryRowLength = params->row_pitch / fmt->texel_size,
+            .memoryImageHeight = params->depth_pitch / params->row_pitch,
+            .imageOffset = { rc.x0, rc.y0, rc.z0 },
+            .imageExtent = { rc.x1, rc.y1, rc.z1 },
+            .imageSubresource = {
+                .aspectMask = tex_vk->aspect,
+                .layerCount = 1,
+            },
+        },
+    }));
+
+    if (params->callback)
+        params->callback(params->priv);
+    return true;
+
+error:
+    return false;
+}
+
 static void tex_xfer_cb(void *ctx, void *arg)
 {
     void (*fun)(void *priv) = ctx;
@@ -867,8 +1010,12 @@ bool vk_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
     struct pl_tex_transfer_params *slices = NULL;
     int num_slices = 0;
 
-    if (!params->buf)
-        return pl_tex_upload_pbo(gpu, params);
+    if (!params->buf) {
+        if (tex_vk->usage_flags & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)
+            return vk_tex_upload_host(gpu, params);
+        else
+            return pl_tex_upload_pbo(gpu, params);
+    }
 
     pl_buf buf = params->buf;
     struct pl_buf_vk *buf_vk = PL_PRIV(buf);
@@ -998,8 +1145,12 @@ bool vk_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
     struct pl_tex_transfer_params *slices = NULL;
     int num_slices = 0;
 
-    if (!params->buf)
-        return pl_tex_download_pbo(gpu, params);
+    if (!params->buf) {
+        if (tex_vk->usage_flags & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT)
+            return vk_tex_download_host(gpu, params);
+        else
+            return pl_tex_download_pbo(gpu, params);
+    }
 
     pl_buf buf = params->buf;
     struct pl_buf_vk *buf_vk = PL_PRIV(buf);
