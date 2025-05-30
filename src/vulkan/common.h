@@ -150,6 +150,8 @@ struct vk_ctx {
     PL_VK_FUN(CmdSetViewport);
     PL_VK_FUN(CmdUpdateBuffer);
     PL_VK_FUN(CmdWriteTimestamp);
+    PL_VK_FUN(CopyImageToMemoryEXT);
+    PL_VK_FUN(CopyMemoryToImageEXT);
     PL_VK_FUN(CreateBuffer);
     PL_VK_FUN(CreateBufferView);
     PL_VK_FUN(CreateCommandPool);
