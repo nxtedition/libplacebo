@@ -36,6 +36,9 @@ struct priv {
     VkSurfaceKHR surf;
     PL_ARRAY(VkSurfaceFormatKHR) formats;
 
+    // true if host implementation has color management support enabled
+    bool have_color_management_support;
+
     // current swapchain and metadata:
     struct pl_vulkan_swapchain_params params;
     VkSwapchainCreateInfoKHR protoInfo; // partially filled-in prototype
@@ -61,33 +64,37 @@ static const struct pl_sw_fns vulkan_swapchain;
 static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
 {
     switch (space) {
-    // Note: This is technically against the spec, but more often than not
-    // it's the correct result since `SRGB_NONLINEAR` is just a catch-all
-    // for any sort of typical SDR curve, which is better approximated by
-    // `pl_color_space_monitor`.
     case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
-        *out = pl_color_space_monitor;
+        *out = (struct pl_color_space) {
+            .primaries = PL_COLOR_PRIM_BT_709,
+            .transfer  = PL_COLOR_TRC_SRGB,
+        };
         return true;
-
     case VK_COLOR_SPACE_BT709_NONLINEAR_EXT:
-        *out = pl_color_space_monitor;
+        *out = (struct pl_color_space) {
+            .primaries = PL_COLOR_PRIM_BT_709,
+            .transfer  = PL_COLOR_TRC_BT_1886,
+        };
         return true;
     case VK_COLOR_SPACE_DISPLAY_P3_NONLINEAR_EXT:
         *out = (struct pl_color_space) {
             .primaries = PL_COLOR_PRIM_DISPLAY_P3,
-            .transfer  = PL_COLOR_TRC_BT_1886,
+            // Actually there are some controversy about Display P3's TRC curve,
+            // just like sRGB
+            .transfer  = PL_COLOR_TRC_SRGB,
         };
         return true;
-    case VK_COLOR_SPACE_DCI_P3_LINEAR_EXT:
+    case VK_COLOR_SPACE_DISPLAY_P3_LINEAR_EXT:
         *out = (struct pl_color_space) {
-            .primaries = PL_COLOR_PRIM_DCI_P3,
+            .primaries = PL_COLOR_PRIM_DISPLAY_P3,
             .transfer  = PL_COLOR_TRC_LINEAR,
         };
         return true;
     case VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT:
+        // This color space is using XYZ color system than RGB
         *out = (struct pl_color_space) {
             .primaries = PL_COLOR_PRIM_DCI_P3,
-            .transfer  = PL_COLOR_TRC_BT_1886,
+            .transfer  = PL_COLOR_TRC_ST428,
         };
         return true;
     case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
@@ -134,6 +141,9 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
         };
         return true;
     case VK_COLOR_SPACE_PASS_THROUGH_EXT:
+        // On color-managed Wayland compositors, it behaves similar to 
+        // VK_COLOR_SPACE_SRGB_NONLINEAR_KHR as they would treat un-tagged surface
+        // as sRGB
         *out = pl_color_space_unknown;
         return true;
 
@@ -226,8 +236,10 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 score += 100;
             if (pl_color_primaries_is_wide_gamut(space.primaries) == wide_gamut)
                 score += 1000;
-            if (space.primaries == hint->primaries)
+            if (space.transfer == PL_COLOR_TRC_LINEAR)
                 score += 2000;
+            if (space.primaries == hint->primaries)
+                score += 4000;
             if (pl_color_transfer_is_hdr(space.transfer) == prefer_hdr)
                 score += 10000;
             if (space.transfer == hint->transfer)
@@ -317,6 +329,17 @@ static void set_hdr_metadata(struct priv *p, const struct pl_hdr_metadata *metad
     p->color_space.hdr = p->hdr_metadata;
 }
 
+// Heuristic to determine if we have actual support for VK_EXT_swapchain_colorspace
+static bool check_color_management_support(const struct priv *p)
+{
+    for (int i = 0; i < p->formats.num; i++) {
+        if (p->formats.elem[i].colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR && p->formats.elem[i].colorSpace != VK_COLOR_SPACE_PASS_THROUGH_EXT) {
+            return true;
+        }
+    }
+    return false;
+}
+
 pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
                               const struct pl_vulkan_swapchain_params *params)
 {
@@ -384,6 +407,8 @@ pl_swapchain pl_vulkan_create_swapchain(pl_vulkan plvk,
     PL_ARRAY_RESIZE(sw, p->formats, num_formats);
     VK(vk->GetPhysicalDeviceSurfaceFormatsKHR(vk->physd, p->surf, &num_formats, p->formats.elem));
     p->formats.num = num_formats;
+
+    p->have_color_management_support = check_color_management_support(p);
 
     PL_INFO(gpu, "Available surface configurations:");
     for (int i = 0; i < p->formats.num; i++) {
@@ -682,7 +707,29 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     p->color_repr.bits.color_depth = bits;
 
     // Note: `p->color_space.hdr` is (re-)applied by `set_hdr_metadata`
-    map_color_space(sinfo.imageColorSpace, &p->color_space);
+    if (p->have_color_management_support) {
+        map_color_space(sinfo.imageColorSpace, &p->color_space);
+    } else {
+        // Compositor doesn't have color management support
+        switch (sinfo.imageColorSpace) {
+        case VK_COLOR_SPACE_SRGB_NONLINEAR_KHR:
+            p->color_space = pl_color_space_monitor;
+            break;
+        case VK_COLOR_SPACE_PASS_THROUGH_EXT:
+            p->color_space = pl_color_space_unknown;
+            break;
+        default:
+            // This should never happen
+            pl_unreachable();
+        }
+    }
+
+    // To convert to XYZ color system for VK_COLOR_SPACE_DCI_P3_NONLINEAR_EXT
+    if (p->color_space.transfer == PL_COLOR_TRC_ST428) {
+        p->color_repr.sys = PL_COLOR_SYSTEM_XYZ;
+    } else {
+        p->color_repr.sys = PL_COLOR_SYSTEM_RGB;
+    }
 
     // Forcibly re-apply HDR metadata, bypassing the no-op check
     struct pl_hdr_metadata metadata = p->hdr_metadata;

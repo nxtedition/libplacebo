@@ -493,6 +493,7 @@ static struct vk_slab *slab_alloc(struct vk_malloc *ma,
 
     default:
         PL_VK_ASSERT(res, "vkAllocateMemory");
+        vk_malloc_print_stats(ma, PL_LOG_TRACE);
     }
 
     slab->mtype = *mtype;
@@ -953,7 +954,7 @@ static bool vk_malloc_import(struct vk_malloc *ma, struct vk_memslice *out,
     case PL_HANDLE_HOST_PTR:
         PL_TRACE(vk, "Imported %s bytes from ptr: %p%s",
                  PRINT_SIZE(slab->size), shmem->handle.ptr,
-                 params->ded_image ? " (dedicated" : "");
+                 params->ded_image ? " (dedicated)" : "");
         slab->handle.ptr = ptrinfo.pHostPointer;
         break;
     case PL_HANDLE_WIN32:
