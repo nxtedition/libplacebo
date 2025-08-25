@@ -42,6 +42,7 @@ struct entry {
     enum pl_field field;
     struct entry *primary;
     struct entry *prev, *next;
+    bool defer_second_field;
     bool dirty;
 };
 
@@ -290,6 +291,13 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
         PL_TRACE(p, "Received EOF, draining frame queue...");
         p->eof = true;
         p->want_frame = false;
+
+        const struct entry *last = p->queue.num ? p->queue.elem[p->queue.num - 1] : NULL;
+        if (last && last->defer_second_field) {
+            PL_WARN(p, "Received EOF while waiting for second field of "
+                    "interlaced frame with PTS %f, discarding last field!",
+                    last->pts);
+        }
         return;
     }
 
@@ -331,8 +339,26 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
                 // Interlaced
                 struct entry *prev = i > 0 ? p->queue.elem[i - 1] : NULL;
                 struct entry *next = i < p->queue.num ? p->queue.elem[i] : NULL;
+                if (prev && prev->defer_second_field) {
+                    struct entry *prev2 = pl_zalloc_ptr(NULL, prev2);
+                    pl_rc_init(&prev2->rc);
+                    prev2->pts = (prev->pts + entry->pts) / 2;
+                    prev2->field = pl_field_other(prev->field);
+                    prev2->primary = entry_ref(prev);
+                    prev2->signature = p->signature++;
+                    PL_ARRAY_INSERT_AT(p, p->queue, i, prev2);
+                    PL_TRACE(p, "Added deferred second field id %"PRIu64" with "
+                             " PTS %f for previous frame with PTS %f",
+                             prev2->signature, prev2->pts, prev->pts);
+
+                    prev->defer_second_field = false;
+                    prev = prev2;
+                    i++;
+                }
+
                 struct entry *entry2 = pl_zalloc_ptr(NULL, entry2);
                 pl_rc_init(&entry2->rc);
+                entry->field = src->first_field;
                 if (next) {
                     entry2->pts = (entry->pts + next->pts) / 2;
                 } else if (src->duration) {
@@ -340,18 +366,17 @@ static void queue_push(pl_queue p, const struct pl_source_frame *src)
                 } else if (p->fps.estimate) {
                     entry2->pts = entry->pts + p->fps.estimate;
                 } else {
-                    PL_ERR(p, "Frame with PTS %f specified as interlaced, but "
-                           "no FPS information known yet! Please specify a "
-                           "valid `pl_source_frame.duration`. Treating as "
-                           "progressive...", src->pts);
+                    PL_DEBUG(p, "Frame with PTS %f specified as interlaced, but "
+                             "no FPS information known yet! Deferring insertion "
+                             "of second field.", src->pts);
+                    entry->defer_second_field = true;
                     PL_ARRAY_INSERT_AT(p, p->queue, i, entry);
                     pl_free(entry2);
                     break;
                 }
 
-                entry->field = src->first_field;
-                entry2->primary = entry_ref(entry);
                 entry2->field = pl_field_other(entry->field);
+                entry2->primary = entry_ref(entry);
                 entry2->signature = p->signature++;
 
                 PL_TRACE(p, "Added second field id %"PRIu64" with PTS %f",
@@ -559,9 +584,10 @@ static bool map_entry(pl_queue p, struct entry *entry)
     return true;
 }
 
-static bool entry_complete(struct entry *entry)
+static bool entry_complete(pl_queue p, struct entry *entry)
 {
-    return entry->field ? !!entry->next : true;
+    pl_assert(!(entry->next && entry->defer_second_field));
+    return entry->field ? (entry->next || p->eof) : true;
 }
 
 // Advance the queue as needed to make sure idx 0 is the last frame before
@@ -601,7 +627,7 @@ retry: ;
     }
 
     pl_assert(p->queue.num);
-    if (!entry_complete(p->queue.elem[PL_MIN(p->queue.num - 1, 1)])) {
+    if (!entry_complete(p, p->queue.elem[PL_MIN(p->queue.num - 1, 1)])) {
         switch (get_frame(p, params)) {
         case PL_QUEUE_ERR:
             return PL_QUEUE_ERR;
@@ -686,7 +712,7 @@ static inline enum pl_queue_status point(pl_queue p, struct pl_frame_mix *mix,
              entry->signature, entry->pts, params->pts);
 
     report_estimates(p);
-    return PL_QUEUE_OK;
+    return entry_complete(p, entry) ? PL_QUEUE_OK : PL_QUEUE_MORE;
 }
 
 // Present a single frame as appropriate for `pts`
@@ -850,7 +876,7 @@ static enum pl_queue_status interpolate(pl_queue p, struct pl_frame_mix *mix,
     while (last_idx && p->queue.elem[last_idx]->pts > max_pts)
         last_idx--;
 
-    if (!entry_complete(p->queue.elem[last_idx])) {
+    if (!entry_complete(p, p->queue.elem[last_idx])) {
         switch ((ret = get_frame(p, params))) {
         case PL_QUEUE_MORE:
         case PL_QUEUE_OK:
