@@ -53,9 +53,9 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
                                int min_order, int max_order)
 {
     if (single) {
-        GLSL("const uint mmr_idx = 0u; \n");
+        GLSL("const int mmr_idx = 0; \n");
     } else {
-        GLSL("uint mmr_idx = uint(coeffs.y); \n");
+        GLSL("int mmr_idx = int(coeffs.y); \n");
     }
 
     assert(min_order <= max_order);
@@ -282,17 +282,10 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
     GLSL("// pl_shader_decode_color \n"
          "{ \n");
 
-    if (repr->sys == PL_COLOR_SYSTEM_XYZ ||
-        repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
+    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
     {
         ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
         GLSL("color.rgb *= vec3("$"); \n", scale);
-    }
-
-    if (repr->sys == PL_COLOR_SYSTEM_XYZ) {
-        pl_shader_linearize(sh, &(struct pl_color_space) {
-            .transfer = PL_COLOR_TRC_ST428,
-        });
     }
 
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
@@ -556,10 +549,6 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
 
     if (!skip) {
         struct pl_color_repr copy = *repr;
-        ident_t xyzscale = NULL_IDENT;
-        if (repr->sys == PL_COLOR_SYSTEM_XYZ)
-            xyzscale = SH_FLOAT(1.0 / pl_color_repr_normalize(&copy));
-
         pl_transform3x3 tr = pl_color_repr_decode(&copy, NULL);
         pl_transform3x3_invert(&tr);
 
@@ -574,13 +563,6 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
         });
 
         GLSL("color.rgb = "$" * color.rgb + "$"; \n", cmat, cmat_c);
-
-        if (repr->sys == PL_COLOR_SYSTEM_XYZ) {
-            pl_shader_delinearize(sh, &(struct pl_color_space) {
-                .transfer = PL_COLOR_TRC_ST428,
-            });
-            GLSL("color.rgb *= vec3("$"); \n", xyzscale);
-        }
     }
 
     GLSL("}\n");
@@ -679,7 +661,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
              PQ_M2, PQ_C1, PQ_C2, PQ_C3, PQ_M1, 10000.0 / PL_COLOR_SDR_WHITE);
         return;
     case PL_COLOR_TRC_HLG: {
-        const float y = fmaxf(1.2f + 0.42f * log10f(csp_max / HLG_REF), 1);
+        const float y = 1.2f * powf(1.111f, log2f(csp_max / HLG_REF));
         const float b = sqrtf(3 * powf(csp_min / csp_max, 1 / y));
         // OETF^-1
         GLSL("color.rgb = "$" * color.rgb + vec3("$");                  \n"
@@ -809,7 +791,7 @@ void pl_shader_delinearize(pl_shader sh, const struct pl_color_space *csp)
              10000 / PL_COLOR_SDR_WHITE, PQ_M1, PQ_C1, PQ_C2, PQ_C3, PQ_M2);
         return;
     case PL_COLOR_TRC_HLG: {
-        const float y = fmaxf(1.2f + 0.42f * log10f(csp_max / HLG_REF), 1);
+        const float y = 1.2f * powf(1.111f, log2f(csp_max / HLG_REF));
         const float b = sqrtf(3 * powf(csp_min / csp_max, 1 / y));
         // OOTF^-1
         GLSL("color.rgb *= 1.0 / "$";                                       \n"
