@@ -256,7 +256,7 @@ PL_LIBAV_API enum AVChromaLocation pl_chroma_to_av(enum pl_chroma_location loc)
     return AVCHROMA_LOC_UNSPECIFIED;
 }
 
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 58, 100)
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 11, 100)
 PL_LIBAV_API enum pl_alpha_mode pl_alpha_from_av(enum AVAlphaMode mode)
 {
     switch (mode) {
@@ -728,9 +728,8 @@ PL_LIBAV_API void pl_frame_from_avframe(struct pl_frame *out,
         .repr = {
             .sys = pl_system_from_av(frame->colorspace),
             .levels = pl_levels_from_av(frame->color_range),
-
-    .alpha = (desc->flags & AV_PIX_FMT_FLAG_ALPHA)
-#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 58, 100)
+            .alpha = (desc->flags & AV_PIX_FMT_FLAG_ALPHA)
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 11, 100)
                 ? pl_alpha_from_av(frame->alpha_mode)
 #else
                 ? PL_ALPHA_INDEPENDENT
