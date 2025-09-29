@@ -69,7 +69,7 @@ struct pl_renderer_t {
     pl_shader_obj grain_state[4];
     pl_shader_obj lut_state[3];
     pl_shader_obj icc_state[2];
-    PL_ARRAY(pl_tex) fbos;
+    PL_ARRAY(pl_tex) fbos[PL_RENDER_STAGE_COUNT];
     struct sampler sampler_main;
     struct sampler sampler_contrast;
     struct sampler samplers_src[4];
@@ -145,8 +145,10 @@ void pl_renderer_destroy(pl_renderer *p_rr)
         return;
 
     // Free all intermediate FBOs
-    for (int i = 0; i < rr->fbos.num; i++)
-        pl_tex_destroy(rr->gpu, &rr->fbos.elem[i]);
+    for (int n = 0; n < PL_ARRAY_SIZE(rr->fbos); n++) {
+        for (int i = 0; i < rr->fbos[n].num; i++)
+            pl_tex_destroy(rr->gpu, &rr->fbos[n].elem[i]);
+    }
     for (int i = 0; i < rr->frames.num; i++)
         pl_tex_destroy(rr->gpu, &rr->frames.elem[i].tex);
     for (int i = 0; i < rr->frame_fbos.num; i++)
@@ -444,6 +446,7 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
                       int comps, pl_debug_tag debug_tag)
 {
     pl_renderer rr = pass->rr;
+    const int n = pass->info.stage;
     comps = PL_DEF(comps, 4);
     fmt = PL_DEF(fmt, pass->fbofmt[comps]);
     if (!fmt)
@@ -464,14 +467,14 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
     int best_diff = 0;
 
     // Find the best-fitting texture out of rr->fbos
-    for (int i = 0; i < rr->fbos.num; i++) {
+    for (int i = 0; i < rr->fbos[n].num; i++) {
         if (pass->fbos_used[i])
             continue;
 
         // Orthogonal distance, with penalty for format mismatches
-        int diff = abs(rr->fbos.elem[i]->params.w - w) +
-                   abs(rr->fbos.elem[i]->params.h - h) +
-                   ((rr->fbos.elem[i]->params.format != fmt) ? 1000 : 0);
+        int diff = abs(rr->fbos[n].elem[i]->params.w - w) +
+                   abs(rr->fbos[n].elem[i]->params.h - h) +
+                   ((rr->fbos[n].elem[i]->params.format != fmt) ? 1000 : 0);
 
         if (best_idx < 0 || diff < best_diff) {
             best_idx = i;
@@ -481,17 +484,17 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
 
     // No texture found at all, add a new one
     if (best_idx < 0) {
-        best_idx = rr->fbos.num;
-        PL_ARRAY_APPEND(rr, rr->fbos, NULL);
-        pl_grow(pass->tmp, &pass->fbos_used, rr->fbos.num * sizeof(bool));
+        best_idx = rr->fbos[n].num;
+        PL_ARRAY_APPEND(rr, rr->fbos[n], NULL);
+        pl_grow(pass->tmp, &pass->fbos_used, rr->fbos[n].num * sizeof(bool));
         pass->fbos_used[best_idx] = false;
     }
 
-    if (!pl_tex_recreate(rr->gpu, &rr->fbos.elem[best_idx], &params))
+    if (!pl_tex_recreate(rr->gpu, &rr->fbos[n].elem[best_idx], &params))
         return NULL;
 
     pass->fbos_used[best_idx] = true;
-    return rr->fbos.elem[best_idx];
+    return rr->fbos[n].elem[best_idx];
 }
 
 // Forcibly convert an img to `tex`, dispatching where necessary
@@ -576,7 +579,7 @@ enum sampler_dir {
 enum sampler_usage {
     SAMPLER_MAIN,
     SAMPLER_PLANE,
-    SAMPLER_CONTRAST,
+    SAMPLER_LOWPASS,
 };
 
 struct sampler_info {
@@ -620,7 +623,7 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
     info.dir = PL_MAX(info.dir_sep[0], info.dir_sep[1]);
     switch (info.dir) {
     case SAMPLER_DOWN:
-        if (usage == SAMPLER_CONTRAST) {
+        if (usage == SAMPLER_LOWPASS) {
             info.config = &pl_filter_bicubic;
         } else if (usage == SAMPLER_PLANE && params->plane_downscaler) {
             info.config = params->plane_downscaler;
@@ -632,7 +635,7 @@ static struct sampler_info sample_src_info(struct pass_state *pass,
         if (usage == SAMPLER_PLANE && params->plane_upscaler) {
             info.config = params->plane_upscaler;
         } else {
-            pl_assert(usage != SAMPLER_CONTRAST);
+            pl_assert(usage != SAMPLER_LOWPASS);
             info.config = params->upscaler;
         }
         break;
@@ -722,7 +725,7 @@ static void dispatch_sampler(struct pass_state *pass, pl_shader sh,
     struct pl_sample_filter_params fparams = {
         .filter      = *info.config,
         .antiring    = params->antiringing_strength,
-        .no_widening = params->skip_anti_aliasing && usage != SAMPLER_CONTRAST,
+        .no_widening = params->skip_anti_aliasing && usage != SAMPLER_LOWPASS,
         .lut         = lut,
     };
 
@@ -2112,7 +2115,7 @@ static pl_tex get_feature_map(struct pass_state *pass)
     };
 
     sh = pl_dispatch_begin(rr->dp);
-    dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_CONTRAST, out_tex, &src);
+    dispatch_sampler(pass, sh, &rr->sampler_contrast, SAMPLER_LOWPASS, out_tex, &src);
     ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
         .shader = &sh,
         .target = out_tex,
@@ -2317,6 +2320,128 @@ error:
     return false;
 }
 
+static pl_tex pass_blur(struct pass_state *pass, pl_tex src_tex, int comps,
+                        struct pl_rect2df *rect, float radius)
+{
+    pl_renderer rr = pass->rr;
+    if (radius <= 0.0f || (src_tex->params.w == 1 && src_tex->params.h == 1))
+        return src_tex;
+
+    #define MAX_BLUR_PASSES 10
+    pl_tex tmp[MAX_BLUR_PASSES+1];
+    ident_t pos, tex;
+
+    const float a_min = 1.0, a_max = 1.8;
+    int passes = ceilf(logf(1.0 + radius * radius / (a_max * a_max)) / logf(4.0f));
+    passes = PL_CLAMP(passes, 2, MAX_BLUR_PASSES);
+
+    float offset = radius / sqrtf(powf(4, passes) - 1.0f);
+    if (offset < a_min && passes > 2)
+        offset = radius / sqrtf(powf(4, --passes) - 1.0f);
+    if (offset > a_max)
+        offset = radius / sqrtf(powf(4, ++passes) - 1.0f);
+
+    int w = rect ? fabsf(pl_rect_w(*rect)) : src_tex->params.w;
+    int h = rect ? fabsf(pl_rect_h(*rect)) : src_tex->params.h;
+    for (int i = 0; i < passes + 1; i++) {
+        tmp[i] = get_fbo(pass, w, h, NULL, comps, PL_DEBUG_TAG);
+        if (!tmp[i])
+            goto error;
+        if (w == 1 && h == 1) {
+            passes = i;
+            break;
+        }
+        w = PL_MAX(w / 2, 1);
+        h = PL_MAX(h / 2, 1);
+    }
+
+    pl_tex prev = src_tex;
+    w = prev->params.w;
+    h = prev->params.h;
+
+    for (int i = 0; i < passes; i++) {
+        pl_shader sh = pl_dispatch_begin(rr->dp);
+        sh_describef(sh, "blur downscale pass %d", i+1);
+        sh->output = PL_SHADER_SIG_COLOR;
+
+        tex = sh_bind(sh, prev, PL_TEX_ADDRESS_MIRROR, PL_TEX_SAMPLE_LINEAR,
+                      "prev", i == 0 ? rect : NULL, &pos, NULL);
+        if (!tex)
+            goto error;
+
+
+    #pragma GLSL /* pass_blur */                                                \
+        vec4 color;                                                             \
+        {                                                                       \
+            vec2 step = vec2(${float: offset / w}, ${float: offset / h});       \
+            color  = textureLod($tex, $pos, 0.0) * 4.0;                         \
+            color += textureLod($tex, $pos - step, 0.0);                        \
+            color += textureLod($tex, $pos + step, 0.0);                        \
+            color += textureLod($tex, $pos - vec2(step.x, -step.y), 0.0);       \
+            color += textureLod($tex, $pos + vec2(step.x, -step.y), 0.0);       \
+            color /= 8.0;                                                       \
+        }
+
+        bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
+            .shader = &sh,
+            .target = tmp[i+1],
+        ));
+        if (!ok)
+            goto error;
+
+        prev = tmp[i+1];
+        w = prev->params.w;
+        h = prev->params.h;
+    }
+
+    if (w == 1 && h == 1)
+        return prev; // upscaling won't change result
+
+    for (int i = passes - 1; i >= 0; i--) {
+        pl_shader sh = pl_dispatch_begin(rr->dp);
+        sh_describef(sh, "blur upscale pass %d", passes - i);
+        sh->output = PL_SHADER_SIG_COLOR;
+
+        tex = sh_bind(sh, prev, PL_TEX_ADDRESS_MIRROR, PL_TEX_SAMPLE_LINEAR,
+                      "prev", NULL, &pos, NULL);
+        if (!tex)
+            goto error;
+
+    #pragma GLSL /* pass_blur */                                                \
+        vec4 color;                                                             \
+        {                                                                       \
+            vec2 step = vec2(${float: offset / w}, ${float: offset / h});       \
+            vec2 step2 = step + step;                                           \
+            color  = textureLod($tex, $pos - vec2(step2.x, 0.0), 0.0);          \
+            color += textureLod($tex, $pos + vec2(step2.x, 0.0), 0.0);          \
+            color += textureLod($tex, $pos - vec2(0.0, step2.y), 0.0);          \
+            color += textureLod($tex, $pos + vec2(0.0, step2.y), 0.0);          \
+            color += textureLod($tex, $pos + vec2(-step.x, -step.y), 0.0) * 2.0;\
+            color += textureLod($tex, $pos + vec2( step.x, -step.y), 0.0) * 2.0;\
+            color += textureLod($tex, $pos + vec2(-step.x,  step.y), 0.0) * 2.0;\
+            color += textureLod($tex, $pos + vec2( step.x,  step.y), 0.0) * 2.0;\
+            color /= 12.0;                                                      \
+        }
+
+        bool ok = pl_dispatch_finish(rr->dp, pl_dispatch_params(
+            .shader = &sh,
+            .target = tmp[i],
+        ));
+        if (!ok)
+            goto error;
+
+        prev = tmp[i];
+        w = prev->params.w;
+        h = prev->params.h;
+    }
+
+    return prev;
+
+error:
+    rr->errors |= PL_RENDER_ERR_BLUR;
+    return NULL;
+}
+
 #define CLEAR_COL(params)                                                       \
     (float[4]) {                                                                \
         (params)->background_color[0],                                          \
@@ -2325,12 +2450,31 @@ error:
         1.0 - (params)->background_transparency,                                \
     }
 
+static uint8_t plane_comps(const struct pl_plane *plane,
+                           const struct pl_render_params *params)
+{
+    uint8_t comps = 0;
+    for (int c = 0; c < plane->components; c++) {
+        if (plane->component_mapping[c] < 0)
+            continue;
+        comps |= 1 << plane->component_mapping[c];
+    }
+    if (params->blend_params) /* preserve alpha if blending */
+        comps |= 1 << PL_CHANNEL_A;
+    return comps;
+}
+
+static int frame_ref(const struct pl_frame *frame);
+
 static void clear_target(pl_renderer rr, const struct pl_frame *target,
+                         const pl_tex background, float bg_scale,
                          const struct pl_render_params *params)
 {
     enum pl_clear_mode border = params->border;
     if (params->skip_target_clearing)
         border = PL_CLEAR_SKIP;
+    if (border == PL_CLEAR_BLUR && !background)
+        border = PL_CLEAR_COLOR;
 
     switch (border) {
     case PL_CLEAR_COLOR:
@@ -2338,6 +2482,104 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
         break;
     case PL_CLEAR_TILES:
         pl_frame_clear_tiles(rr->gpu, target, params->tile_colors, params->tile_size);
+        break;
+    case PL_CLEAR_BLUR: ;
+        // Map of the output frame buffer:
+        //
+        //   0-----1-------------2-----------3
+        //   |     .             .           |
+        //   |     8-------------9           | <- y0
+        //   |     |             |           |
+        //   |     |             |           |
+        //   |     A-------------B           | <- y1
+        //   |     .             .           |
+        //   4-----5-------------6-----------7
+        //         ^x0           ^x1
+        //
+        // Generate the following quads:
+        //
+        //   0-1-4-5 (if x0 > 0)
+        //   2-3-6-7 (if x1 < w)
+        //   1-2-8-9 (if y0 > 0)
+        //   A-B-5-6 (if y1 < h)
+
+        const struct pl_plane *ref = &target->planes[frame_ref(target)];
+        const float w  = ref->texture->params.w, h = ref->texture->params.h;
+        const float x0 = target->crop.x0 / w, x1 = target->crop.x1 / w;
+        const float y0 = target->crop.y0 / h, y1 = target->crop.y1 / h;
+
+        float vertices[12][2] = {
+            {  0,  0 }, { x0,  0 }, { x1,  0 }, {  1,  0 },
+            {  0,  1 }, { x0,  1 }, { x1,  1 }, {  1,  1 },
+            { x0, y0 }, { x1, y0 }, { x0, y1 }, { x1, y1 },
+        };
+
+        uint16_t indices[4 * 6];
+        int nb_indices = 0;
+        #define ADD_QUAD(A, B, C, D)   \
+        do {                           \
+            indices[nb_indices++] = A; \
+            indices[nb_indices++] = B; \
+            indices[nb_indices++] = C; \
+            indices[nb_indices++] = C; \
+            indices[nb_indices++] = B; \
+            indices[nb_indices++] = D; \
+        } while (0)
+
+        if (x0 > 0)
+            ADD_QUAD(0, 1, 4, 5);
+        if (x1 < 1)
+            ADD_QUAD(2, 3, 6, 7);
+        if (y0 > 0)
+            ADD_QUAD(1, 2, 8, 9);
+        if (y1 < 1)
+            ADD_QUAD(10, 11, 5, 6);
+
+        for (int p = 0; p < target->num_planes; p++) {
+            const struct pl_plane *plane = &target->planes[p];
+
+            pl_shader sh = pl_dispatch_begin(rr->dp);
+            sh_describe(sh, "draw border");
+            sh->output = PL_SHADER_SIG_COLOR;
+
+            ident_t tex = sh_desc(sh, (struct pl_shader_desc) {
+                .desc = {
+                    .name = "bg_tex",
+                    .type = PL_DESC_SAMPLED_TEX,
+                },
+                .binding = {
+                    .object = background,
+                    .address_mode = PL_TEX_ADDRESS_CLAMP,
+                    .sample_mode = PL_TEX_SAMPLE_LINEAR,
+                },
+            });
+
+            GLSL("vec4 color = textureLod("$", pos, 0.0); \n"
+                 "color.%s *= vec%d(1.0 / "$"); \n",
+                 tex,
+                 params->blend_params ? "rgb" : "rgba",
+                 params->blend_params ? 3 : 4,
+                 SH_FLOAT(bg_scale));
+
+            swizzle_color(sh, plane->components, plane->component_mapping,
+                          params->blend_params);
+
+            pl_dispatch_vertex(rr->dp, pl_dispatch_vertex_params(
+                .shader             = &sh,
+                .target             = plane->texture,
+                .blend_params       = params->blend_params,
+                .vertex_attribs     = rr->osd_attribs, // reuse position attrib
+                .num_vertex_attribs = 1,
+                .vertex_flipped     = plane->flipped,
+                .vertex_stride      = sizeof(float[2]),
+                .vertex_coords      = PL_COORDS_RELATIVE,
+                .vertex_type        = PL_PRIM_TRIANGLE_LIST,
+                .vertex_count       = nb_indices,
+                .vertex_data        = vertices,
+                .index_data         = indices,
+                .index_fmt          = PL_INDEX_UINT16,
+            ));
+        }
         break;
     case PL_CLEAR_SKIP: break;
     case PL_CLEAR_MODE_COUNT: pl_unreachable();
@@ -2487,10 +2729,10 @@ static bool pass_output_target(struct pass_state *pass)
             img->comps = 3;
             break;
         case PL_CLEAR_SKIP: break;
+        case PL_CLEAR_BLUR: // invalid for background
         case PL_CLEAR_MODE_COUNT: pl_unreachable();
         }
     }
-
 
     // Apply the color scale separately, after encoding is done, to make sure
     // that the intermediate FBO (if any) has the correct precision.
@@ -2530,8 +2772,30 @@ static bool pass_output_target(struct pass_state *pass)
     bool flipped_x = dst_rect.x1 < dst_rect.x0,
          flipped_y = dst_rect.y1 < dst_rect.y0;
 
-    if (pl_frame_is_cropped(target))
-        clear_target(rr, target, params);
+    if (pl_frame_is_cropped(target)) {
+        pl_tex border_tex = NULL;
+        if (params->border == PL_CLEAR_BLUR && !(rr->errors & PL_RENDER_ERR_BLUR)) {
+            pl_tex tex = img_tex(pass, img);
+            if (!tex) {
+                PL_ERR(rr, "Output requires blurred borders, but FBOs are "
+                    "unavailable. This combination is unsupported.");
+                return false;
+            }
+
+            const int ref_w = ref->texture->params.w, ref_h = ref->texture->params.h;
+            pl_rect2df rect = img->rect;
+            pl_rect2df_aspect_set(&rect, (float) ref_w / ref_h, 0.0);
+            pl_rect2df_rotate(&rect, pass->rotation);
+
+            border_tex = pass_blur(pass, tex, img->comps, &rect, params->blur_radius);
+            if (!border_tex) {
+                PL_ERR(rr, "Failed to generate blurred borders.");
+                return false;
+            }
+        }
+
+        clear_target(rr, target, border_tex, scale, params);
+    }
 
     for (int p = 0; p < target->num_planes; p++) {
         const struct pl_plane *plane = &target->planes[p];
@@ -2577,6 +2841,7 @@ static bool pass_output_target(struct pass_state *pass)
                     .y0 = (ry0 - plane_rectf.y0) / rry,
                     .y1 = (ry1 - plane_rectf.y0) / rry,
                 },
+                .component_mask = plane_comps(plane, params),
             };
 
             if (!src.tex) {
@@ -2589,15 +2854,6 @@ static bool pass_output_target(struct pass_state *pass)
                      pass->img.w, pass->img.h,
                      src.rect.x0, src.rect.y0,
                      src.rect.x1, src.rect.y1);
-
-            for (int c = 0; c < plane->components; c++) {
-                if (plane->component_mapping[c] < 0)
-                    continue;
-                src.component_mask |= 1 << plane->component_mapping[c];
-            }
-
-            if (params->blend_params) /* preserve alpha if blending */
-                src.component_mask |= 1 << PL_CHANNEL_A;
 
             sh = pl_dispatch_begin(rr->dp);
             dispatch_sampler(pass, sh, &rr->samplers_dst[p], SAMPLER_PLANE,
@@ -3112,7 +3368,7 @@ static void pass_begin_frame(struct pass_state *pass)
             params->hooks[i]->reset(params->hooks[i]->priv);
     }
 
-    size_t size = rr->fbos.num * sizeof(bool);
+    size_t size = rr->fbos[pass->info.stage].num * sizeof(bool);
     pass->fbos_used = pl_realloc(pass->tmp, pass->fbos_used, size);
     memset(pass->fbos_used, 0, size);
 }
@@ -3133,7 +3389,7 @@ static bool draw_empty_overlays(pl_renderer rr,
     if (!pass_init(&pass, false))
         return false;
 
-    clear_target(rr, ptarget, params);
+    clear_target(rr, ptarget, NULL, 0.0f, params);
     if (!ptarget->num_overlays)
         goto done;
 
@@ -3717,6 +3973,7 @@ inter_pass_error:
         .h = out_h,
         .comps = comps,
         .color = target->color,
+        .rect = { 0, 0, out_w, out_h },
         .repr = {
             .sys = PL_COLOR_SYSTEM_RGB,
             .levels = PL_COLOR_LEVELS_PC,
