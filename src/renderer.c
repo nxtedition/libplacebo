@@ -452,6 +452,7 @@ static pl_tex get_fbo(struct pass_state *pass, int w, int h, pl_fmt fmt,
     if (!fmt)
         return NULL;
 
+    pl_assert(w && h);
     struct pl_tex_params params = {
         .w          = w,
         .h          = h,
@@ -2341,8 +2342,8 @@ static pl_tex pass_blur(struct pass_state *pass, pl_tex src_tex, int comps,
     if (offset > a_max)
         offset = radius / sqrtf(powf(4, ++passes) - 1.0f);
 
-    int w = rect ? fabsf(pl_rect_w(*rect)) : src_tex->params.w;
-    int h = rect ? fabsf(pl_rect_h(*rect)) : src_tex->params.h;
+    int w = rect ? ceilf(fabsf(pl_rect_w(*rect))) : src_tex->params.w;
+    int h = rect ? ceilf(fabsf(pl_rect_h(*rect))) : src_tex->params.h;
     for (int i = 0; i < passes + 1; i++) {
         tmp[i] = get_fbo(pass, w, h, NULL, comps, PL_DEBUG_TAG);
         if (!tmp[i])
@@ -2508,11 +2509,20 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
         const float x0 = target->crop.x0 / w, x1 = target->crop.x1 / w;
         const float y0 = target->crop.y0 / h, y1 = target->crop.y1 / h;
 
-        float vertices[12][2] = {
-            {  0,  0 }, { x0,  0 }, { x1,  0 }, {  1,  0 },
-            {  0,  1 }, { x0,  1 }, { x1,  1 }, {  1,  1 },
-            { x0, y0 }, { x1, y0 }, { x0, y1 }, { x1, y1 },
+        struct { float pos[2]; float coord[2]; } vertices[12] = {
+            { .coord = {  0,  0 } }, { .coord = { x0,  0 } },
+            { .coord = { x1,  0 } }, { .coord = {  1,  0 } },
+            { .coord = {  0,  1 } }, { .coord = { x0,  1 } },
+            { .coord = { x1,  1 } }, { .coord = {  1,  1 } },
+            { .coord = { x0, y0 } }, { .coord = { x1, y0 } },
+            { .coord = { x0, y1 } }, { .coord = { x1, y1 } },
         };
+
+
+        for (int i = 0; i < PL_ARRAY_SIZE(vertices); i++) {
+            vertices[i].pos[0] = 2.0f * vertices[i].coord[0] - 1.0f;
+            vertices[i].pos[1] = 2.0f * vertices[i].coord[1] - 1.0f;
+        }
 
         uint16_t indices[4 * 6];
         int nb_indices = 0;
@@ -2554,7 +2564,7 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
                 },
             });
 
-            GLSL("vec4 color = textureLod("$", pos, 0.0); \n"
+            GLSL("vec4 color = textureLod("$", coord, 0.0); \n"
                  "color.%s *= vec%d(1.0 / "$"); \n",
                  tex,
                  params->blend_params ? "rgb" : "rgba",
@@ -2568,11 +2578,11 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
                 .shader             = &sh,
                 .target             = plane->texture,
                 .blend_params       = params->blend_params,
-                .vertex_attribs     = rr->osd_attribs, // reuse position attrib
-                .num_vertex_attribs = 1,
+                .vertex_attribs     = rr->osd_attribs, // reuse OSD attribs
+                .num_vertex_attribs = 2,
                 .vertex_flipped     = plane->flipped,
-                .vertex_stride      = sizeof(float[2]),
-                .vertex_coords      = PL_COORDS_RELATIVE,
+                .vertex_stride      = sizeof(vertices[0]),
+                .vertex_coords      = PL_COORDS_NORMALIZED,
                 .vertex_type        = PL_PRIM_TRIANGLE_LIST,
                 .vertex_count       = nb_indices,
                 .vertex_data        = vertices,
@@ -2584,6 +2594,23 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
     case PL_CLEAR_SKIP: break;
     case PL_CLEAR_MODE_COUNT: pl_unreachable();
     }
+}
+
+static void translate_srgb_color(float out_color[3], const float in_color[3],
+                                 const struct pl_color_space *csp)
+{
+    struct pl_color_space srgb = pl_color_space_srgb;
+    srgb.hdr.min_luma = csp->hdr.min_luma; // use the same contrast
+
+    const struct pl_raw_primaries *src_prim = pl_raw_primaries_get(srgb.primaries);
+    const struct pl_raw_primaries *dst_prim = pl_raw_primaries_get(csp->primaries);
+
+    memcpy(out_color, in_color, sizeof(float[3]));
+    pl_color_linearize(&srgb, out_color);
+    pl_matrix3x3 tr = pl_get_color_mapping_matrix(src_prim, dst_prim,
+                                                  PL_INTENT_RELATIVE_COLORIMETRIC);
+    pl_matrix3x3_apply(&tr, out_color);
+    pl_color_delinearize(csp, out_color);
 }
 
 static bool pass_output_target(struct pass_state *pass)
@@ -2700,11 +2727,13 @@ static bool pass_output_target(struct pass_state *pass)
     if (img->comps == 4 && need_blend) {
         pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_PREMULTIPLIED);
         switch (background) {
-        case PL_CLEAR_COLOR:
+        case PL_CLEAR_COLOR:;
+            float bg_color[3];
+            translate_srgb_color(bg_color, params->background_color, &target->color);
             GLSL("color += (1.0 - color.a) * vec4("$", "$", "$", "$"); \n",
-                 SH_FLOAT(params->background_color[0]),
-                 SH_FLOAT(params->background_color[1]),
-                 SH_FLOAT(params->background_color[2]),
+                 SH_FLOAT(bg_color[0]),
+                 SH_FLOAT(bg_color[1]),
+                 SH_FLOAT(bg_color[2]),
                  SH_FLOAT(1.0 - params->background_transparency));
             if (!params->background_transparency || !has_alpha) {
                 img->repr.alpha = PL_ALPHA_NONE;
@@ -2713,9 +2742,15 @@ static bool pass_output_target(struct pass_state *pass)
             break;
         case PL_CLEAR_TILES:;
             static const float zero[2][3] = {0};
-            const float (*color)[3] = params->tile_colors;
-            if (memcmp(color, zero, sizeof(zero)) == 0)
-                color = pl_render_default_params.tile_colors;
+            float color[2][3];
+            if (memcmp(params->tile_colors, zero, sizeof(zero)) == 0) {
+                translate_srgb_color(color[0], pl_render_default_params.tile_colors[0], &target->color);
+                translate_srgb_color(color[1], pl_render_default_params.tile_colors[1], &target->color);
+            } else {
+                translate_srgb_color(color[0], params->tile_colors[0], &target->color);
+                translate_srgb_color(color[1], params->tile_colors[1], &target->color);
+            }
+
             GLSL("vec2 outcoord = gl_FragCoord.xy * "$";                    \n"
                  "bvec2 tile = lessThan(fract(outcoord), vec2(0.5));        \n"
                  "vec3 tile_color = tile.x == tile.y ? vec3("$", "$", "$")  \n"
@@ -4097,9 +4132,10 @@ void pl_frame_clear_tiles(pl_gpu gpu, const struct pl_frame *frame,
     pl_transform3x3_invert(&tr);
 
     float encoded[2][3];
-    memcpy(encoded, tile_colors, sizeof(encoded));
-    pl_transform3x3_apply(&tr, encoded[0]);
-    pl_transform3x3_apply(&tr, encoded[1]);
+    for (int i = 0; i < PL_ARRAY_SIZE(encoded); i++) {
+        translate_srgb_color(encoded[i], tile_colors[i], &frame->color);
+        pl_transform3x3_apply(&tr, encoded[i]);
+    }
 
     pl_tex ref = frame->planes[frame_ref(frame)].texture;
 
@@ -4148,7 +4184,8 @@ void pl_frame_clear_rgba(pl_gpu gpu, const struct pl_frame *frame,
     pl_transform3x3 tr = pl_color_repr_decode(&repr, NULL);
     pl_transform3x3_invert(&tr);
 
-    float encoded[3] = { rgba[0], rgba[1], rgba[2] };
+    float encoded[3];
+    translate_srgb_color(encoded, rgba, &frame->color);
     pl_transform3x3_apply(&tr, encoded);
 
     float mult = frame->repr.alpha == PL_ALPHA_PREMULTIPLIED ? rgba[3] : 1.0;
