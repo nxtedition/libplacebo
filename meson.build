@@ -399,7 +399,7 @@ conf_internal.set('PL_DEBUG_ABORT', get_option('debug-abort'))
 build_opts = [
   # Warnings
   '-Wundef', '-Wshadow', '-Wparentheses', '-Wpointer-arith',
-  '-fno-math-errno',
+  '-fno-math-errno', '-fno-signed-zeros', '-fno-trapping-math',
 ]
 
 link_args = []
@@ -421,6 +421,10 @@ c_opts = [
 
 if cc.has_argument('-Wincompatible-pointer-types')
   c_opts += ['-Werror=incompatible-pointer-types']
+endif
+
+if cc.has_argument('-Wc23-extensions')
+  c_opts += ['-Wno-c23-extensions']
 endif
 
 # clang's version of -Wmissing-braces rejects the common {0} initializers

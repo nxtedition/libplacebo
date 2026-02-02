@@ -61,6 +61,7 @@ PL_LIBAV_API enum pl_color_system pl_system_from_av(enum AVColorSpace spc)
     case AVCOL_SPC_SMPTE240M:           return PL_COLOR_SYSTEM_SMPTE_240M;
     case AVCOL_SPC_YCGCO:               return PL_COLOR_SYSTEM_YCGCO;
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 13, 100)
+    case AVCOL_SPC_IPT_C2:              return PL_COLOR_SYSTEM_UNKNOWN; // missing
     case AVCOL_SPC_YCGCO_RE:            return PL_COLOR_SYSTEM_YCGCO_RE;
     case AVCOL_SPC_YCGCO_RO:            return PL_COLOR_SYSTEM_YCGCO_RO;
 #endif
@@ -148,6 +149,10 @@ PL_LIBAV_API enum pl_color_primaries pl_primaries_from_av(enum AVColorPrimaries 
     case AVCOL_PRI_SMPTE431:        return PL_COLOR_PRIM_DCI_P3;
     case AVCOL_PRI_SMPTE432:        return PL_COLOR_PRIM_DISPLAY_P3;
     case AVCOL_PRI_JEDEC_P22:       return PL_COLOR_PRIM_EBU_3213;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 16, 100)
+    case AVCOL_PRI_V_GAMUT:         return PL_COLOR_PRIM_V_GAMUT;
+    case AVCOL_PRI_EXT_NB:          return PL_COLOR_PRIM_UNKNOWN;
+#endif
     case AVCOL_PRI_NB:              return PL_COLOR_PRIM_UNKNOWN;
     }
 
@@ -170,7 +175,11 @@ PL_LIBAV_API enum AVColorPrimaries pl_primaries_to_av(enum pl_color_primaries pr
     case PL_COLOR_PRIM_CIE_1931:    return AVCOL_PRI_SMPTE428;
     case PL_COLOR_PRIM_DCI_P3:      return AVCOL_PRI_SMPTE431;
     case PL_COLOR_PRIM_DISPLAY_P3:  return AVCOL_PRI_SMPTE432;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 16, 100)
+    case PL_COLOR_PRIM_V_GAMUT:     return AVCOL_PRI_V_GAMUT;
+#else
     case PL_COLOR_PRIM_V_GAMUT:     return AVCOL_PRI_UNSPECIFIED; // missing
+#endif
     case PL_COLOR_PRIM_S_GAMUT:     return AVCOL_PRI_UNSPECIFIED; // missing
     case PL_COLOR_PRIM_FILM_C:      return AVCOL_PRI_FILM;
     case PL_COLOR_PRIM_ACES_AP0:    return AVCOL_PRI_UNSPECIFIED; // missing
@@ -203,6 +212,10 @@ PL_LIBAV_API enum pl_color_transfer pl_transfer_from_av(enum AVColorTransferChar
     case AVCOL_TRC_SMPTE2084:       return PL_COLOR_TRC_PQ;
     case AVCOL_TRC_SMPTE428:        return PL_COLOR_TRC_ST428;
     case AVCOL_TRC_ARIB_STD_B67:    return PL_COLOR_TRC_HLG;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 16, 100)
+    case AVCOL_TRC_V_LOG:           return PL_COLOR_TRC_V_LOG;
+    case AVCOL_TRC_EXT_NB:          return PL_COLOR_TRC_UNKNOWN;
+#endif
     case AVCOL_TRC_NB:              return PL_COLOR_TRC_UNKNOWN;
     }
 
@@ -226,7 +239,11 @@ PL_LIBAV_API enum AVColorTransferCharacteristic pl_transfer_to_av(enum pl_color_
     case PL_COLOR_TRC_PRO_PHOTO:    return AVCOL_TRC_UNSPECIFIED; // missing
     case PL_COLOR_TRC_PQ:           return AVCOL_TRC_SMPTE2084;
     case PL_COLOR_TRC_HLG:          return AVCOL_TRC_ARIB_STD_B67;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(60, 16, 100)
+    case PL_COLOR_TRC_V_LOG:        return AVCOL_TRC_V_LOG;
+#else
     case PL_COLOR_TRC_V_LOG:        return AVCOL_TRC_UNSPECIFIED; // missing
+#endif
     case PL_COLOR_TRC_S_LOG1:       return AVCOL_TRC_UNSPECIFIED; // missing
     case PL_COLOR_TRC_S_LOG2:       return AVCOL_TRC_UNSPECIFIED; // missing
     case PL_COLOR_TRC_COUNT:        return AVCOL_TRC_UNSPECIFIED;
@@ -1030,7 +1047,7 @@ static bool pl_map_avframe_drm(pl_gpu gpu, struct pl_frame *out,
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(hwfc->sw_format);
     const AVDRMFrameDescriptor *drm = (AVDRMFrameDescriptor *) frame->data[0];
     assert(frame->format == AV_PIX_FMT_DRM_PRIME);
-    if (!(gpu->import_caps.tex & PL_HANDLE_DMA_BUF))
+    if (!(gpu->import_caps.tex & PL_HANDLE_DMA_BUF) || !out->num_planes)
         return false;
 
     assert(drm->nb_layers >= out->num_planes);

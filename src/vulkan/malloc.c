@@ -34,7 +34,7 @@
 // starting with the minimum until the maximum is reached.
 //
 // Note: The maximum must never exceed the size of `vk_slab.spacemap`.
-#define MINIMUM_PAGE_COUNT 4
+#define MINIMUM_PAGE_COUNT 1
 #define MAXIMUM_PAGE_COUNT (sizeof(uint64_t) * 8)
 
 // Controls the maximum page size. Any allocations above this threshold
@@ -356,6 +356,9 @@ static bool buf_external_check(struct vk_ctx *vk, VkBufferUsageFlags usage,
 {
     if (!handle_type)
         return true;
+
+    if (handle_type == PL_HANDLE_HOST_PTR && !vk->GetMemoryHostPointerPropertiesEXT)
+        return false;
 
     VkPhysicalDeviceExternalBufferInfo info = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO_KHR,
@@ -739,6 +742,7 @@ static struct vk_slab *pool_get_page(struct vk_malloc *ma, struct vk_pool *pool,
 
         slab->spacemap ^= 0x1LLU << page_idx;
         *offset = page_idx * slab->pagesize;
+        slab->age = ma->age;
         return slab;
     }
 
@@ -1057,7 +1061,6 @@ bool vk_malloc_slice(struct vk_malloc *ma, struct vk_memslice *out,
         // consumers are always aligned properly.
         size = PL_ALIGN(size, align);
         slab->used += size;
-        slab->age = ma->age;
         if (params->debug_tag)
             slab->debug_tag = params->debug_tag;
         pl_mutex_unlock(&slab->lock);
