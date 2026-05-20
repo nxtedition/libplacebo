@@ -246,6 +246,7 @@ PL_LIBAV_API enum AVColorTransferCharacteristic pl_transfer_to_av(enum pl_color_
 #endif
     case PL_COLOR_TRC_S_LOG1:       return AVCOL_TRC_UNSPECIFIED; // missing
     case PL_COLOR_TRC_S_LOG2:       return AVCOL_TRC_UNSPECIFIED; // missing
+    case PL_COLOR_TRC_SCRGB:        return AVCOL_TRC_UNSPECIFIED; // missing
     case PL_COLOR_TRC_COUNT:        return AVCOL_TRC_UNSPECIFIED;
     }
 
@@ -776,6 +777,9 @@ PL_LIBAV_API void pl_frame_from_avframe(struct pl_frame *out,
         },
     };
 
+    if (frame->sample_aspect_ratio.num && frame->sample_aspect_ratio.den)
+        out->pixel_aspect_ratio = av_q2d(frame->sample_aspect_ratio);
+
     pl_color_space_from_avframe(&out->color, frame);
 
     if (frame->colorspace == AVCOL_SPC_ICTCP &&
@@ -869,6 +873,9 @@ PL_LIBAV_API void pl_frame_copy_stream_props(struct pl_frame *out,
         out->rotation = pl_rotation_normalize(4.5 - rot / 90.0);
     }
 
+    if (stream->sample_aspect_ratio.num && stream->sample_aspect_ratio.den)
+        out->pixel_aspect_ratio = av_q2d(stream->sample_aspect_ratio);
+
 #ifdef PL_HAVE_LAV_HDR
     pl_map_hdr_metadata(&out->color.hdr, &(struct pl_av_hdr_metadata) {
         .mdm = (void *) pl_av_stream_get_side_data(stream,
@@ -939,12 +946,45 @@ PL_LIBAV_API void pl_map_dovi_metadata(struct pl_dovi_metadata *out,
     }
 }
 
+static bool pl_avdovi_nlq_is_trivial(const AVDOVIRpuDataHeader *header,
+                                     const AVDOVINLQParams *nlq)
+{
+    return nlq->nlq_offset == 0 &&
+           nlq->vdr_in_max == (1ULL << header->coef_log2_denom) &&
+           nlq->linear_deadzone_slope == 0 &&
+           nlq->linear_deadzone_threshold == 0;
+}
+
+static bool pl_avdovi_mapping_nlq_is_trivial(const AVDOVIRpuDataHeader *header,
+                                             const AVDOVIDataMapping *mapping)
+{
+    return mapping->nlq_method_idc == AV_DOVI_NLQ_LINEAR_DZ &&
+           pl_avdovi_nlq_is_trivial(header, &mapping->nlq[0]) &&
+           pl_avdovi_nlq_is_trivial(header, &mapping->nlq[1]) &&
+           pl_avdovi_nlq_is_trivial(header, &mapping->nlq[2]);
+}
+
+PL_LIBAV_API bool pl_avdovi_metadata_supported(const AVDOVIMetadata *metadata)
+{
+    const AVDOVIRpuDataHeader *header;
+    const AVDOVIDataMapping *mapping;
+
+    header = av_dovi_get_header(metadata);
+    if (header->disable_residual_flag)
+        return true;
+
+    mapping = av_dovi_get_mapping(metadata);
+    if (pl_avdovi_mapping_nlq_is_trivial(header, mapping))
+        return true;
+
+    return false;
+}
+
 PL_LIBAV_API void pl_map_avdovi_metadata(struct pl_color_space *color,
                                          struct pl_color_repr *repr,
                                          struct pl_dovi_metadata *dovi,
                                          const AVDOVIMetadata *metadata)
 {
-    const AVDOVIRpuDataHeader *header;
     const AVDOVIColorMetadata *dovi_color;
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 12, 100)
     const AVDOVIDmData *dovi_ext;
@@ -952,27 +992,24 @@ PL_LIBAV_API void pl_map_avdovi_metadata(struct pl_color_space *color,
     if (!color || !repr || !dovi)
         return;
 
-    header = av_dovi_get_header(metadata);
     dovi_color = av_dovi_get_color(metadata);
-    if (header->disable_residual_flag) {
-        pl_map_dovi_metadata(dovi, metadata);
+    pl_map_dovi_metadata(dovi, metadata);
 
-        repr->dovi = dovi;
-        repr->sys = PL_COLOR_SYSTEM_DOLBYVISION;
-        color->primaries = PL_COLOR_PRIM_BT_2020;
-        color->transfer = PL_COLOR_TRC_PQ;
-        color->hdr.min_luma =
-            pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, dovi_color->source_min_pq / 4095.0f);
-        color->hdr.max_luma =
-            pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, dovi_color->source_max_pq / 4095.0f);
+    repr->dovi = dovi;
+    repr->sys = PL_COLOR_SYSTEM_DOLBYVISION;
+    color->primaries = PL_COLOR_PRIM_BT_2020;
+    color->transfer = PL_COLOR_TRC_PQ;
+    color->hdr.min_luma =
+        pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, dovi_color->source_min_pq / 4095.0f);
+    color->hdr.max_luma =
+        pl_hdr_rescale(PL_HDR_PQ, PL_HDR_NITS, dovi_color->source_max_pq / 4095.0f);
 
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(59, 12, 100)
-        if ((dovi_ext = av_dovi_find_level(metadata, 1))) {
-            color->hdr.max_pq_y = dovi_ext->l1.max_pq / 4095.0f;
-            color->hdr.avg_pq_y = dovi_ext->l1.avg_pq / 4095.0f;
-        }
-#endif
+    if ((dovi_ext = av_dovi_find_level(metadata, 1))) {
+        color->hdr.max_pq_y = dovi_ext->l1.max_pq / 4095.0f;
+        color->hdr.avg_pq_y = dovi_ext->l1.avg_pq / 4095.0f;
     }
+#endif
 }
 
 PL_LIBAV_API void pl_frame_map_avdovi_metadata(struct pl_frame *out_frame,
@@ -981,7 +1018,8 @@ PL_LIBAV_API void pl_frame_map_avdovi_metadata(struct pl_frame *out_frame,
 {
     if (!out_frame)
         return;
-    pl_map_avdovi_metadata(&out_frame->color, &out_frame->repr, dovi, metadata);
+    if (pl_avdovi_metadata_supported(metadata))
+        pl_map_avdovi_metadata(&out_frame->color, &out_frame->repr, dovi, metadata);
 }
 #endif // PL_HAVE_LAV_DOLBY_VISION
 
@@ -1033,6 +1071,44 @@ struct pl_avframe_priv {
     pl_tex planar; // for planar vulkan textures
 };
 
+#define COMP_MAX(x, y) ((x) > (y) ? (x) : (y))
+#define COMP_MIN(x, y) ((x) < (y) ? (x) : (y))
+#define COMP_ABS(x) ((x) < 0 ? -(x) : (x))
+
+static void pl_map_hwframe_bit_encoding(struct pl_bit_encoding *out_bits,
+                                        enum AVPixelFormat pix_fmt)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
+    struct pl_bit_encoding bits = {0};
+    bool is_supported = true;
+    if (!out_bits || !desc)
+        return;
+
+    // Calculate bit encoding from all components (excluding alpha)
+    for (int c = 0; c < COMP_MIN(desc->nb_components, 3); c++) {
+        const AVComponentDescriptor *comp = &desc->comp[c];
+        struct pl_bit_encoding cbits = {
+            .sample_depth = comp->depth + COMP_ABS(comp->shift),
+            .color_depth  = comp->depth,
+            .bit_shift    = COMP_MAX(comp->shift, 0),
+        };
+
+        if (bits.sample_depth && !pl_bit_encoding_equal(&bits, &cbits)) {
+            // Bit encoding differs between components, cannot handle this
+            is_supported = false;
+            break;
+        }
+
+        bits = cbits;
+    }
+    if (is_supported)
+        *out_bits = bits;
+}
+
+#undef COMP_MAX
+#undef COMP_MIN
+#undef COMP_ABS
+
 static void pl_fix_hwframe_sample_depth(struct pl_frame *out)
 {
     pl_fmt fmt = out->planes[0].texture->params.format;
@@ -1081,12 +1157,8 @@ static bool pl_map_avframe_drm(pl_gpu gpu, struct pl_frame *out,
             return false;
     }
 
+    pl_map_hwframe_bit_encoding(&out->repr.bits, hwfc->sw_format);
     pl_fix_hwframe_sample_depth(out);
-
-    switch (hwfc->sw_format) {
-    case AV_PIX_FMT_P010: out->repr.bits.bit_shift = 6; break;
-    default: break;
-    }
 
     return true;
 }
@@ -1227,8 +1299,11 @@ static bool pl_map_avframe_vulkan(pl_gpu gpu, struct pl_frame *out,
     if (!vk)
         return false;
 
+    pl_map_hwframe_bit_encoding(&out->repr.bits, hwfc->sw_format);
+
     for (int n = 0; n < out->num_planes; n++) {
         struct pl_plane *plane = &out->planes[n];
+        struct pl_bit_encoding bits = {0};
         bool chroma = n == 1 || n == 2;
         int num_subplanes;
         assert(vk_fmt[n]);
@@ -1237,7 +1312,7 @@ static bool pl_map_avframe_vulkan(pl_gpu gpu, struct pl_frame *out,
             .image  = vkf->img[n],
             .width  = AV_CEIL_RSHIFT(hwfc->width, chroma ? desc->log2_chroma_w : 0),
             .height = AV_CEIL_RSHIFT(hwfc->height, chroma ? desc->log2_chroma_h : 0),
-            .format = map_vk_fmt(vkfc, vk_fmt[n], &out->repr.bits),
+            .format = map_vk_fmt(vkfc, vk_fmt[n], &bits),
             .usage  = vkfc->usage,
         ));
         if (!plane->texture)
@@ -1246,6 +1321,15 @@ static bool pl_map_avframe_vulkan(pl_gpu gpu, struct pl_frame *out,
         num_subplanes = plane->texture->params.format->num_planes;
         if (num_subplanes) {
             assert(num_subplanes == out->num_planes);
+
+            // Cannot shift on non-mutable multiplane vk image
+            if (!n && num_subplanes > 1 && out->repr.bits.bit_shift) {
+                if (vkfc->img_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
+                    assert(out->repr.bits.bit_shift == bits.bit_shift);
+                else
+                    out->repr.bits.bit_shift = 0;
+            }
+
             priv->planar = plane->texture;
             for (int i = 0; i < num_subplanes; i++)
                 out->planes[i].texture = priv->planar->planes[i];
@@ -1292,9 +1376,8 @@ PL_LIBAV_API bool pl_map_avframe_ex(pl_gpu gpu, struct pl_frame *out,
         AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
         if (sd) {
             const AVDOVIMetadata *metadata = (AVDOVIMetadata *) sd->data;
-            const AVDOVIRpuDataHeader *header = av_dovi_get_header(metadata);
-            // Only automatically map DoVi RPUs that don't require an EL
-            if (header->disable_residual_flag)
+            // Only automatically map DoVi RPUs that don't require a (full) EL
+            if (params->map_dovi_force || pl_avdovi_metadata_supported(metadata))
                 pl_map_avdovi_metadata(&out->color, &out->repr, &priv->dovi, metadata);
         }
 

@@ -42,11 +42,11 @@ static pl_tex create_test_img(pl_gpu gpu)
             float *color = &data[(y * WIDTH + x) * COMPS];
             float xx = x - xc, yy = y - yc;
             float r2 = xx * xx + yy * yy;
-            switch (COMPS) {
-            case 4: color[3] = 1.0;
-            case 3: color[2] = 0.5f * sinf(freqB * r2) + 0.5f;;
-            case 2: color[1] = 0.5f * sinf(freqG * r2) + 0.5f;;
-            case 1: color[0] = 0.5f * sinf(freqR * r2) + 0.5f;;
+            switch ((int) COMPS) {
+            case 4: color[3] = 1.0; /* fall through */
+            case 3: color[2] = 0.5f * sinf(freqB * r2) + 0.5f; /* fall through */
+            case 2: color[1] = 0.5f * sinf(freqG * r2) + 0.5f; /* fall through */
+            case 1: color[0] = 0.5f * sinf(freqR * r2) + 0.5f; break;
             }
         }
     }
@@ -349,6 +349,20 @@ static void bench_yadif(pl_shader sh, pl_shader_obj *state, pl_tex src)
     ));
 }
 
+static void bench_bwdif(pl_shader sh, pl_shader_obj *state, pl_tex src)
+{
+    struct pl_deinterlace_source dsrc = {
+        .prev = pl_field_pair(src),
+        .cur = pl_field_pair(src),
+        .next = pl_field_pair(src),
+        .field = PL_FIELD_TOP,
+    };
+
+    pl_shader_deinterlace(sh, &dsrc, pl_deinterlace_params(
+        .algo = PL_DEINTERLACE_BWDIF,
+    ));
+}
+
 static void bench_av1_grain(pl_shader sh, pl_shader_obj *state, pl_tex src)
 {
     struct pl_film_grain_params params = {
@@ -516,6 +530,7 @@ int main()
     benchmark(vk->gpu, "weave", BENCH_SH(bench_weave));
     benchmark(vk->gpu, "bob", BENCH_SH(bench_bob));
     benchmark(vk->gpu, "yadif", BENCH_SH(bench_yadif));
+    benchmark(vk->gpu, "bwdif", BENCH_SH(bench_bwdif));
 
     // Polar sampling
     benchmark(vk->gpu, "polar", BENCH_SH(bench_polar));

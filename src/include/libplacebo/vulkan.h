@@ -356,6 +356,18 @@ struct pl_vulkan_swapchain_params {
     // drivers which don't dither properly when outputting high bit depth
     // SDR backbuffers to 8-bit screens.
     bool disable_10bit_sdr;
+
+    // Minimum number of alpha bits requested in the swapchain format. In
+    // practice, this can be used to prefer formats with higher alpha bit depth
+    // (e.g. rgba8/rgba16 over rgb10a2), potentially trading 2 bits per color
+    // channel for increased alpha precision. This is a hint, if no matching
+    // format is found, lower bit depths will be accepted.
+    uint8_t alpha_bits;
+
+    // Minimum number of color bits requested in the swapchain format. This can
+    // be used to prefer formats with higher color bit depth. This is a hint,
+    // if no matching format is found, lower bit depths will be accepted.
+    uint8_t color_bits;
 };
 
 #define pl_vulkan_swapchain_params(...) (&(struct pl_vulkan_swapchain_params) { __VA_ARGS__ })
@@ -421,6 +433,9 @@ struct pl_vulkan_import_params {
 
     // Functions for locking a queue. If set, these will be used instead of
     // libplacebo's internal functions for `pl_vulkan.(un)lock_queue`.
+    // If not set, libplacebo will use its own internal locking, unless the
+    // device was created with VK_KHR_internally_synchronized_queues enabled
+    // (as indicated by `features`), in which case locking is skipped.
     void (*lock_queue)(void *ctx, uint32_t qf, uint32_t qidx);
     void (*unlock_queue)(void *ctx, uint32_t qf, uint32_t qidx);
     void *queue_ctx;

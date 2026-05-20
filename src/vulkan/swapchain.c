@@ -100,6 +100,11 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
         };
         return true;
     case VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT:
+        *out = (struct pl_color_space) {
+            .primaries = PL_COLOR_PRIM_BT_709,
+            .transfer  = PL_COLOR_TRC_SCRGB,
+        };
+        return true;
     case VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT:
         // TODO
         return false;
@@ -143,11 +148,12 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
         };
         return true;
     case VK_COLOR_SPACE_PASS_THROUGH_EXT:
-        // On color-managed Wayland compositors, it behaves similar to
-        // VK_COLOR_SPACE_SRGB_NONLINEAR_KHR as they would treat un-tagged surface
-        // as sRGB, but on other OSes it's behavior is not clearly defined, so
-        // don't use it.
-        return false;
+        // Platform specific output color space, map to unknown
+        *out = (struct pl_color_space) {
+            .primaries = PL_COLOR_PRIM_UNKNOWN,
+            .transfer  = PL_COLOR_TRC_UNKNOWN,
+        };
+        return true;
 
 #ifdef VK_AMD_display_native_hdr
     case VK_COLOR_SPACE_DISPLAY_NATIVE_AMD:
@@ -159,13 +165,20 @@ static bool map_color_space(VkColorSpaceKHR space, struct pl_color_space *out)
     }
 }
 
+static inline int quant_score(int depth, int requested)
+{
+    pl_assert(depth >= 0 && depth <= 16);
+    pl_assert(requested >= 0 && requested <= 16);
+    return requested <= depth ? 0 : 17 * (16 - depth) + requested - depth;
+}
+
 static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
 {
     struct priv *p = PL_PRIV(sw);
     struct vk_ctx *vk = p->vk;
     pl_gpu gpu = sw->gpu;
 
-    int best_score = 0, best_id;
+    int best_score = -1000, best_id;
     bool wide_gamut = pl_color_primaries_is_wide_gamut(hint->primaries);
     bool prefer_hdr = pl_color_transfer_is_hdr(hint->transfer);
 
@@ -197,8 +210,11 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 case 8:
                     if (pl_color_transfer_is_hdr(space.transfer))
                         score += 10;
-                    else if (space.transfer == PL_COLOR_TRC_LINEAR)
+                    else if (space.transfer == PL_COLOR_TRC_LINEAR ||
+                             space.transfer == PL_COLOR_TRC_SCRGB)
                         continue; // avoid 8-bit linear formats
+                    else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
+                        score += 10;
                     else if (disable10)
                         score += 30;
                     else
@@ -207,8 +223,11 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 case 10:
                     if (pl_color_transfer_is_hdr(space.transfer))
                         score += 30;
-                    else if (space.transfer == PL_COLOR_TRC_LINEAR)
+                    else if (space.transfer == PL_COLOR_TRC_LINEAR ||
+                             space.transfer == PL_COLOR_TRC_SCRGB)
                         continue; // avoid 10-bit linear formats
+                    else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
+                        score += 20;
                     else if (disable10)
                         score += 20;
                     else
@@ -217,7 +236,10 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 case 16:
                     if (pl_color_transfer_is_hdr(space.transfer))
                         score += 20;
-                    else if (space.transfer == PL_COLOR_TRC_LINEAR)
+                    else if (space.transfer == PL_COLOR_TRC_LINEAR ||
+                             space.transfer == PL_COLOR_TRC_SCRGB)
+                        score += 30;
+                    else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
                         score += 30;
                     else if (disable10)
                         score += 10;
@@ -227,6 +249,12 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 default: // skip any other format
                     continue;
             }
+            int alpha_depth = plfmt->num_components < 4 ? 0 : PL_MIN(plfmt->component_depth[3], 16);
+            int err = quant_score(plfmt->component_depth[0], PL_MIN(p->params.color_bits, 16)) +
+                      quant_score(alpha_depth, PL_MIN(p->params.alpha_bits, 16));
+            // Reset score if we don't meet the requested bit depth
+            if (err)
+                score = -err;
 #ifdef __APPLE__
             // On Apple hardware, only these formats allow direct-to-display
             // rendering, so give them a slight score boost to tie-break against
@@ -255,6 +283,8 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
                 score += 10000;
             if (space.transfer == hint->transfer)
                 score += 20000;
+            else if (space.transfer == PL_COLOR_TRC_UNKNOWN)
+                continue; // allow unknown (PASS_THROUGH_EXT) only if requested
 
             switch (plfmt->type) {
             case PL_FMT_UNKNOWN: break;
@@ -274,7 +304,7 @@ static bool pick_surf_format(pl_swapchain sw, const struct pl_color_space *hint)
         }
     }
 
-    if (!best_score) {
+    if (best_score == -1000) {
         PL_ERR(vk, "Failed picking any valid, renderable surface format!");
         return false;
     }
@@ -517,8 +547,37 @@ static bool update_swapchain_info(struct priv *p, VkSwapchainCreateInfoKHR *info
 
     // Query the supported capabilities and update this struct as needed
     VkSurfaceCapabilitiesKHR caps = {0};
-    VK(vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physd, p->surf, &caps));
+    if (!vk->GetPhysicalDeviceSurfaceCapabilities2KHR) {
+        VK(vk->GetPhysicalDeviceSurfaceCapabilitiesKHR(vk->physd, p->surf, &caps));
+        goto caps_ready;
+    }
 
+    VkSurfacePresentModeKHR present_mode = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
+        .presentMode = p->protoInfo.presentMode,
+    };
+    VkPhysicalDeviceSurfaceInfo2KHR surface_info = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+        .pNext = &present_mode,
+        .surface = p->surf,
+    };
+#ifdef VK_EXT_full_screen_exclusive
+    // Explicitly disallow full screen exclusive mode if possible
+    static const VkSurfaceFullScreenExclusiveInfoEXT fsinfo = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
+        .fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT,
+    };
+    if (vk->AcquireFullScreenExclusiveModeEXT)
+        vk_link_struct(&surface_info, &fsinfo);
+#endif
+
+    VkSurfaceCapabilities2KHR surface_caps = {
+        .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+    };
+    VK(vk->GetPhysicalDeviceSurfaceCapabilities2KHR(vk->physd, &surface_info, &surface_caps));
+    caps = surface_caps.surfaceCapabilities;
+
+caps_ready:
     // Check for hidden/invisible window
     if (!caps.currentExtent.width || !caps.currentExtent.height) {
         PL_DEBUG(vk, "maxImageExtent reported as 0x0, hidden window? skipping");
@@ -649,8 +708,7 @@ static bool vk_sw_image_init(pl_swapchain sw, int idx)
 
     pl_assert(current->vkimages.elem[idx] != VK_NULL_HANDLE);
 
-    char name[32];
-    snprintf(name, sizeof(name), "swapchain #%d", idx);
+    char *name = pl_asprintf(NULL, "swapchain #%d", idx);
     pl_tex tex = pl_vulkan_wrap(gpu, pl_vulkan_wrap_params(
         .image = current->vkimages.elem[idx],
         .width = p->protoInfo.imageExtent.width,
@@ -660,8 +718,11 @@ static bool vk_sw_image_init(pl_swapchain sw, int idx)
         .debug_tag = name,
     ));
 
-    if (!tex)
+    if (!tex) {
+        pl_free(name);
         goto error;
+    }
+    pl_steal((void *) tex, name);
 
     current->images.elem[idx] = tex;
     current->vkimages.elem[idx] = VK_NULL_HANDLE;
@@ -720,9 +781,6 @@ static bool vk_sw_recreate(pl_swapchain sw, int w, int h)
     p->needs_recreate = false;
     p->cur_width = sinfo.imageExtent.width;
     p->cur_height = sinfo.imageExtent.height;
-
-    if (p->has_swapchain_maintenance1)
-        sinfo.flags |= VK_SWAPCHAIN_CREATE_DEFERRED_MEMORY_ALLOCATION_BIT_KHR;
 
     PL_DEBUG(sw, "(Re)creating swapchain of size %dx%d",
              sinfo.imageExtent.width,
@@ -1023,7 +1081,19 @@ static void vk_sw_colorspace_hint(pl_swapchain sw, const struct pl_color_space *
 
     // This should never fail if the swapchain already exists
     bool ok = pick_surf_format(sw, csp);
-    set_hdr_metadata(p, &csp->hdr);
+
+    if (p->protoInfo.imageColorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT) {
+        // Don't try to apply anything for VK_COLOR_SPACE_PASS_THROUGH_EXT and
+        // also immediately cleanup the retired swapchain. This is needed
+        // because the driver might hold Wayland color surface parented to that
+        // swapchain.
+        if (p->needs_recreate) {
+            vk_sw_recreate(sw, 0, 0);
+            cleanup_retired_swapchains(sw, UINT64_MAX);
+        }
+    } else {
+        set_hdr_metadata(p, &csp->hdr);
+    }
     pl_assert(ok);
 
     pl_mutex_unlock(&p->lock);

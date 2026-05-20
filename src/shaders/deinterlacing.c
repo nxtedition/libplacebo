@@ -84,13 +84,20 @@ void pl_shader_deinterlace(pl_shader sh, const struct pl_deinterlace_source *src
     }
 
     ident_t prev = cur, next = cur;
-    if (params->algo >= PL_DEINTERLACE_YADIF) {
+    const int bw = PL_DEF(sh_glsl(sh).subgroup_size, 32);
+    if (params->algo == PL_DEINTERLACE_YADIF) {
         // Try using a compute shader for these, for the sole reason of
         // optimizing for thread group synchronicity. Otherwise, because we
         // alternate between lines output as-is and lines output deinterlaced,
         // half of our thread group will be mostly idle at any point in time.
-        const int bw = PL_DEF(sh_glsl(sh).subgroup_size, 32);
         sh_try_compute(sh, bw, 1, true, 0);
+    } else{
+        // Try using a compute shader with a 2D block size for 
+        // cache locality between threads in the non-intra-only case
+        const int bw2d = bw >= 64 ? 8 : 4;
+        const int bh2d = bw >= 64 ? 8 : 8;
+        sh_try_compute(sh, bw2d, bh2d, true, 0);
+
     }
 
     if (!intra_only && src->prev.top && src->prev.top != src->cur.top) {
@@ -264,9 +271,9 @@ void pl_shader_deinterlace(pl_shader sh, const struct pl_deinterlace_source *src
         #define T ${vecType: comp_mask}                                         \
         T $process(T cur[4], T prev[2], T next[2], T prev2[5], T next2[5])      \
         {                                                                       \
-            const float lf[2] = { 4309.0/8192.0,  213/8192.0 };                 \
-            const float hf[3] = { 5570.0/8192.0, 3801/8192.0, 1016/8192.0 };    \
-            const float sp[2] = { 5077.0/8192.0,  981/8192.0 };                 \
+            const float lf[2] = float[]( 4309.0/8192.0,  213.0/8192.0 );        \
+            const float hf[3] = float[]( 5570.0/8192.0, 3801.0/8192.0, 1016.0/8192.0 ); \
+            const float sp[2] = float[]( 5077.0/8192.0,  981.0/8192.0 );        \
                                                                                 \
             T s = prev2[2] + next2[2];                                          \
             T d = s / 2.0;                                                      \
@@ -310,7 +317,7 @@ void pl_shader_deinterlace(pl_shader sh, const struct pl_deinterlace_source *src
                                                                                 \
         T $intra(T cur[4])                                                      \
         {                                                                       \
-            const float sp[2] = { 5077.0/8192.0,  981/8192.0 };                 \
+            const float sp[2] = float[]( 5077.0/8192.0, 981.0/8192.0 );         \
             return sp[0] * (cur[1] + cur[2]) - sp[1] * (cur[0] + cur[3]);       \
         }                                                                       \
         #undef T                                                                \
