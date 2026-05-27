@@ -760,7 +760,7 @@ static enum pl_queue_status oversample(pl_queue p, struct pl_frame_mix *mix,
 
     // Can't oversample with only a single frame, fall back to point sampling
     if (p->queue.num < 2 || p->queue.elem[0]->pts > params->pts) {
-        if (point(p, mix, params) != PL_QUEUE_OK)
+        if (point(p, mix, params) == PL_QUEUE_ERR)
             return PL_QUEUE_ERR;
         return ret;
     }
@@ -1042,6 +1042,9 @@ enum pl_queue_status pl_queue_update(pl_queue p, struct pl_frame_mix *out_mix,
         // We don't know the vsync duration (yet), so just point-sample
         ret = nearest(p, out_mix, params);
     }
+
+    if (ret == PL_QUEUE_ERR)
+        PL_ERR(p, "Failed updating frame queue for target PTS %f!", params->pts);
 
     pl_cond_signal(&p->wakeup);
     pl_mutex_unlock(&p->lock_weak);

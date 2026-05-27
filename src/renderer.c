@@ -3642,11 +3642,6 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
     if (!out_w || !out_h)
         goto fallback;
 
-    // Frames are cached and blended in linear light to avoid flickering
-    // on high-contrast transitions
-    struct pl_color_space mix_csp = target->color;
-    mix_csp.transfer = PL_COLOR_TRC_LINEAR;
-
     int fidx = 0;
     struct cached_frame frames[MAX_MIX_FRAMES];
     float weights[MAX_MIX_FRAMES];
@@ -3784,7 +3779,7 @@ retry:
                         f->tex->params.h == out_h &&
                         pl_rect2d_eq(f->crop, img->crop) &&
                         f->params_hash == par_info.hash &&
-                        pl_color_space_equal(&f->color, &mix_csp) &&
+                        pl_color_space_equal(&f->color, &target->color) &&
                         pl_icc_profile_equal(&f->profile, &target->profile);
         }
 
@@ -3832,11 +3827,6 @@ retry:
             if (!pass_init(&inter_pass, true))
                 goto fail;
 
-            // Override transfer after pass_init, we want consistent mix_csp,
-            // and avoid any inference that happens in pass_fix_frames. This is
-            // later applied on main output pass.
-            inter_pass.target.color = mix_csp;
-
             pass_begin_frame(&inter_pass);
             if (!(ok = pass_read_image(&inter_pass)))
                 goto inter_pass_error;
@@ -3845,8 +3835,6 @@ retry:
             pass_convert_colors(&inter_pass);
 
             pl_assert(inter_pass.img.sh); // guaranteed by `pass_convert_colors`
-            pl_assert(inter_pass.img.color.transfer == PL_COLOR_TRC_LINEAR);
-
             pl_shader_set_alpha(inter_pass.img.sh, &inter_pass.img.repr,
                                 PL_ALPHA_PREMULTIPLIED); // for frame mixing
 
@@ -3938,8 +3926,16 @@ inter_pass_error:
 
     GLSL("vec4 color;                   \n"
          "// pl_render_image_mix        \n"
-         "{                             \n"
-         "vec4 mix_color = vec4(0.0);   \n");
+         "{                             \n");
+
+    // With a single frame there is nothing to mix, so we can skip the
+    // linearize/delinearize roundtrip.
+    bool mixing = fidx > 1;
+    struct pl_color_space mix_csp = target->color;
+    if (mixing) {
+        mix_csp.transfer = PL_COLOR_TRC_LINEAR;
+        GLSL("vec4 mix_color = vec4(0.0); \n");
+    }
 
     int comps = 0;
     for (int i = 0; i < fidx; i++) {
@@ -3972,13 +3968,16 @@ inter_pass_error:
         }
         pl_shader_set_alpha(sh, &frame_repr, PL_ALPHA_PREMULTIPLIED);
 
-        float weight = weights[i] / wsum;
-        GLSL("mix_color += vec4("$") * color; \n", SH_FLOAT_DYN(weight));
+        if (mixing) {
+            float weight = weights[i] / wsum;
+            GLSL("mix_color += vec4("$") * color; \n", SH_FLOAT_DYN(weight));
+        }
         comps = PL_MAX(comps, frames[i].comps);
     }
 
-    GLSL("color = mix_color; \n"
-         "}                  \n");
+    if (mixing)
+        GLSL("color = mix_color; \n");
+    GLSL("} \n");
 
     // Dispatch this to the destination
     pass.img = (struct img) {
