@@ -101,6 +101,7 @@ struct vk_sync_scope vk_sem_barrier(struct vk_cmd *cmd, struct vk_sem *sem,
 struct vk_cmdpool {
     struct vk_ctx *vk;
     VkQueueFamilyProperties props;
+    VkDeviceQueueCreateFlags flags;
     int qf; // queue family index
     VkCommandPool pool;
     pl_vulkan_sem *sync;
@@ -115,7 +116,8 @@ struct vk_cmdpool {
 // Set up a vk_cmdpool corresponding to a queue family. `qnum` may be less than
 // `props.queueCount`, to restrict the number of queues in this queue family.
 struct vk_cmdpool *vk_cmdpool_create(struct vk_ctx *vk, int qf, int qnum,
-                                     VkQueueFamilyProperties props);
+                                     VkQueueFamilyProperties props,
+                                     VkDeviceQueueCreateFlags flags);
 
 void vk_cmdpool_destroy(struct vk_cmdpool *pool);
 
