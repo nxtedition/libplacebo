@@ -901,7 +901,7 @@ static bool try_host_xfer(pl_gpu gpu, pl_tex tex, bool upload)
     const PL_ARRAY(VkImageLayout) *layouts = upload ? (void *) &p->host_ul_layouts
                                                     : (void *) src_layouts;
 
-    if (!(tex_vk->usage_flags & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) |
+    if (!(tex_vk->usage_flags & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) ||
         !layouts->num || tex->params.format->emulated)
         return false;
 
@@ -970,7 +970,7 @@ static bool vk_tex_upload_host(pl_gpu gpu, const struct pl_tex_transfer_params *
             .memoryRowLength = params->row_pitch / fmt->texel_size,
             .memoryImageHeight = params->depth_pitch / params->row_pitch,
             .imageOffset = { rc.x0, rc.y0, rc.z0 },
-            .imageExtent = { rc.x1, rc.y1, rc.z1 },
+            .imageExtent = { pl_rect_w(rc), pl_rect_h(rc), pl_rect_d(rc) },
             .imageSubresource = {
                 .aspectMask = tex_vk->aspect,
                 .layerCount = 1,
@@ -1088,7 +1088,7 @@ bool vk_tex_upload(pl_gpu gpu, const struct pl_tex_transfer_params *params)
             .bufferRowLength = params->row_pitch / fmt->texel_size,
             .bufferImageHeight = params->depth_pitch / params->row_pitch,
             .imageOffset = { rc.x0, rc.y0, rc.z0 },
-            .imageExtent = { rc.x1, rc.y1, rc.z1 },
+            .imageExtent = { pl_rect_w(rc), pl_rect_h(rc), pl_rect_d(rc) },
             .imageSubresource = {
                 .aspectMask = tex_vk->aspect,
                 .layerCount = 1,
@@ -1220,7 +1220,7 @@ bool vk_tex_download(pl_gpu gpu, const struct pl_tex_transfer_params *params)
             .bufferRowLength = params->row_pitch / fmt->texel_size,
             .bufferImageHeight = params->depth_pitch / params->row_pitch,
             .imageOffset = { rc.x0, rc.y0, rc.z0 },
-            .imageExtent = { rc.x1, rc.y1, rc.z1 },
+            .imageExtent = { pl_rect_w(rc), pl_rect_h(rc), pl_rect_d(rc) },
             .imageSubresource = {
                 .aspectMask = tex_vk->aspect,
                 .layerCount = 1,

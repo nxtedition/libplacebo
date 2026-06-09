@@ -276,8 +276,9 @@ struct vk_sync_scope vk_sem_barrier(struct vk_cmd *cmd, struct vk_sem *sem,
         // Special case: this is a pure layout transition (with no command),
         // in this case we need to ensure that we still emit some sort of
         // synchronization scope or else the layers complain
-        if (stage == VK_PIPELINE_STAGE_2_NONE) {
+        if (stage == VK_PIPELINE_STAGE_2_NONE && is_write) {
             last.stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            last.access = VK_ACCESS_2_MEMORY_WRITE_BIT;
         }
     }
 
@@ -457,7 +458,7 @@ static VkResult vk_queue_submit2(struct vk_ctx *vk, VkQueue queue,
 
     for (int i = 0; i < num_deps; i++) {
         deps[i] = info2->pWaitSemaphoreInfos[i].semaphore;
-        masks[i] = info2->pWaitSemaphoreInfos[i].stageMask;
+        masks[i] = lower_stage2(info2->pWaitSemaphoreInfos[i].stageMask);
         depvals[i] = info2->pWaitSemaphoreInfos[i].value;
     }
     for (int i = 0; i < num_sigs; i++) {
