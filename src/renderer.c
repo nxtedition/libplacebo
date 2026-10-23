@@ -140,21 +140,19 @@ static void sampler_destroy(pl_renderer rr, struct sampler *sampler)
     pl_shader_obj_destroy(&sampler->downscaler_state);
 }
 
-void pl_renderer_destroy(pl_renderer *p_rr)
+static void renderer_uninit(pl_renderer rr)
 {
-    pl_renderer rr = *p_rr;
-    if (!rr)
-        return;
-
     // Free all intermediate FBOs
     for (int n = 0; n < PL_ARRAY_SIZE(rr->fbos); n++) {
         for (int i = 0; i < rr->fbos[n].num; i++)
             pl_tex_destroy(rr->gpu, &rr->fbos[n].elem[i]);
+        rr->fbos[n].num = 0;
     }
     for (int i = 0; i < rr->frames.num; i++)
         pl_tex_destroy(rr->gpu, &rr->frames.elem[i].tex);
     for (int i = 0; i < rr->frame_fbos.num; i++)
         pl_tex_destroy(rr->gpu, &rr->frame_fbos.elem[i]);
+    rr->frames.num = rr->frame_fbos.num = 0;
 
     // Free all shader resource objects
     pl_shader_obj_destroy(&rr->tone_map_state);
@@ -177,11 +175,34 @@ void pl_renderer_destroy(pl_renderer *p_rr)
         sampler_destroy(rr, &rr->samplers_el[i]);
 
     // Free fallback ICC profiles
-    for (int i = 0; i < PL_ARRAY_SIZE(rr->icc_fallback); i++)
+    for (int i = 0; i < PL_ARRAY_SIZE(rr->icc_fallback); i++) {
         pl_icc_close(&rr->icc_fallback[i].icc);
+        rr->icc_fallback[i].error = 0;
+    }
 
     pl_dispatch_destroy(&rr->dp);
+}
+
+void pl_renderer_destroy(pl_renderer *p_rr)
+{
+    pl_renderer rr = *p_rr;
+    if (!rr)
+        return;
+
+    renderer_uninit(rr);
     pl_free_ptr(p_rr);
+}
+
+void pl_renderer_reset(pl_renderer rr)
+{
+    if (!rr)
+        return;
+
+    renderer_uninit(rr);
+    rr->dp = pl_dispatch_create(rr->log, rr->gpu);
+    pl_assert(rr->dp);
+
+    pl_renderer_reset_errors(rr, NULL);
 }
 
 size_t pl_renderer_save(pl_renderer rr, uint8_t *out)
@@ -196,6 +217,9 @@ void pl_renderer_load(pl_renderer rr, const uint8_t *cache)
 
 void pl_renderer_flush_cache(pl_renderer rr)
 {
+    if (!rr)
+        return;
+
     for (int i = 0; i < rr->frames.num; i++)
         pl_tex_destroy(rr->gpu, &rr->frames.elem[i].tex);
     rr->frames.num = 0;
@@ -794,14 +818,18 @@ fallback:
     pl_shader_sample_direct(sh, src);
 }
 
-// also clamps to the range implied by `repr`
+// also clamps to the range implied by `repr`, for non-float formats
 static void swizzle_color(pl_shader sh, int comps, const int comp_map[4],
-                          bool force_alpha, const struct pl_color_repr *repr)
+                          bool force_alpha, const struct pl_color_repr *repr,
+                          pl_fmt fmt)
 {
     ident_t orig = sh_fresh(sh, "orig_color");
     GLSL("vec4 "$" = color;                 \n"
          "color = vec4(0.0, 0.0, 0.0, 1.0); \n", orig);
 
+    // Floating point formats have no representable range to clamp to, and
+    // legitimately carry values outside of [0, 1] (e.g. scRGB, linear XYZ)
+    const bool clamp = fmt->type != PL_FMT_FLOAT;
     float min[4], max[4];
     pl_color_repr_limits(repr, min, max);
 
@@ -812,8 +840,12 @@ static void swizzle_color(pl_shader sh, int comps, const int comp_map[4],
         const int idx = comp_map[c];
         if (idx < 0)
             continue;
-        GLSL("color[%d] = clamp("$"[%d], "$", "$"); \n",
-             c, orig, idx, SH_FLOAT(min[idx]), SH_FLOAT(max[idx]));
+        if (clamp) {
+            GLSL("color[%d] = clamp("$"[%d], "$", "$"); \n",
+                 c, orig, idx, SH_FLOAT(min[idx]), SH_FLOAT(max[idx]));
+        } else {
+            GLSL("color[%d] = "$"[%d]; \n", c, orig, idx);
+        }
     }
 
     if (force_alpha)
@@ -831,6 +863,12 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
     pl_renderer rr = pass->rr;
     if (num <= 0 || (rr->errors & PL_RENDER_ERR_OVERLAY))
         return;
+
+    // XYZ is encoded in linear light, from the frame's tagged primaries
+    const struct pl_color_space fbo_color = color;
+    const bool encode_xyz = repr.sys == PL_COLOR_SYSTEM_XYZ;
+    if (encode_xyz)
+        color.transfer = PL_COLOR_TRC_LINEAR;
 
     enum pl_fmt_caps caps = fbo->params.format->caps;
     if (!(rr->errors & PL_RENDER_ERR_BLENDING) &&
@@ -987,7 +1025,9 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
         pl_color_space_infer_map(&ol_color, &target_color);
         if (image && pl_color_space_equal(&ol_color, &image->color)) {
             const struct pl_color_map_params *cmp = pass->params->color_map_params;
-            pl_shader_color_map_ex(sh, cmp, pl_color_map_args(
+            struct pl_color_map_params overlay_cmp = *PL_DEF(cmp, &pl_color_map_default_params);
+            overlay_cmp.visualize_lut = false;
+            pl_shader_color_map_ex(sh, &overlay_cmp, pl_color_map_args(
                 .src   = ol_color,
                 .dst   = color,
                 .state = &rr->tone_map_state,
@@ -999,13 +1039,18 @@ static void draw_overlays(struct pass_state *pass, pl_tex fbo,
             pl_icc_encode(sh, target->icc, &rr->icc_state[ICC_TARGET]);
 
         bool premul = repr.alpha == PL_ALPHA_PREMULTIPLIED;
-        pl_shader_encode_color(sh, &repr);
+        pl_shader_encode_color_ex(sh, pl_color_encode_args(
+            .repr      = &repr,
+            .primaries = color.primaries,
+        ));
+        if (encode_xyz)
+            pl_shader_delinearize(sh, &fbo_color);
         if (ol.mode == PL_OVERLAY_MONOCHROME) {
             GLSL("color.%s *= textureLod("$", coord, 0.0).r; \n",
                  premul ? "rgba" : "a", tex);
         }
 
-        swizzle_color(sh, comps, comp_map, true, &repr);
+        swizzle_color(sh, comps, comp_map, true, &repr, fbo->params.format);
 
         struct pl_blend_params blend_params = {
             .src_rgb = premul ? PL_BLEND_ONE : PL_BLEND_SRC_ALPHA,
@@ -1220,8 +1265,9 @@ static void hdr_update_peak(struct pass_state *pass)
     if (max_peak <= pass->target.color.hdr.max_luma + 1e-6)
         goto cleanup; // no adaptation needed
 
-    if (pass->img.color.hdr.avg_pq_y)
-        goto cleanup; // DV metadata already present
+    if (pl_hdr_metadata_contains(&pass->img.color.hdr, PL_HDR_METADATA_HDR10PLUS) &&
+        pl_hdr_metadata_contains(&pass->img.color.hdr, PL_HDR_METADATA_CIE_Y))
+        goto cleanup; // metadata already present
 
     enum pl_hdr_metadata_type metadata = PL_HDR_METADATA_ANY;
     if (params->color_map_params)
@@ -1350,9 +1396,11 @@ static bool plane_deband(struct pass_state *pass, struct img *img, float neutral
     // Divide the deband grain scale by the effective current colorspace nominal
     // peak, to make sure the output intensity of the grain is as independent
     // of the source as possible, even though it happens this early in the
-    // process (well before any linearization / output adaptation)
+    // process (well before any linearization / output adaptation). SDR signals
+    // peak at their reference white, whatever its luminance is.
     struct pl_deband_params dparams = *params->deband_params;
-    dparams.grain /= image->color.hdr.max_luma / PL_COLOR_SDR_WHITE;
+    if (pl_color_transfer_is_hdr(image->color.transfer))
+        dparams.grain /= image->color.hdr.max_luma / PL_COLOR_SDR_WHITE;
     memcpy(dparams.grain_neutral, neutral, sizeof(dparams.grain_neutral));
 
     img->tex = NULL;
@@ -1922,12 +1970,14 @@ static bool pass_read_image(struct pass_state *pass)
          SH_FLOAT(neutral_luma), SH_FLOAT(neutral_chroma));
 
     // For quality reasons, explicitly drop subpixel offsets from the ref rect
-    // and re-add them as part of `pass->img.rect`, always rounding towards 0.
-    // Additionally, drop anamorphic subpixel mismatches.
+    // and re-add them as part of `pass->img.rect`, rounding to the nearest
+    // pixel. (Since the offset may be dropped entirely at 1:1 scale, rounding
+    // towards 0 would turn float error like 0.99999994 into a whole pixel
+    // shift.) Additionally, drop anamorphic subpixel mismatches.
     const pl_rect2df ref_rc = ref->img.rect;
     pl_rect2d ref_rounded;
-    ref_rounded.x0 = truncf(ref_rc.x0);
-    ref_rounded.y0 = truncf(ref_rc.y0);
+    ref_rounded.x0 = roundf(ref_rc.x0);
+    ref_rounded.y0 = roundf(ref_rc.y0);
     ref_rounded.x1 = ref_rounded.x0 + roundf(pl_rect_w(ref_rc));
     ref_rounded.y1 = ref_rounded.y0 + roundf(pl_rect_h(ref_rc));
 
@@ -2062,6 +2112,7 @@ static bool pass_read_image(struct pass_state *pass)
 
     if (needs_conversion) {
         if (pass->img.repr.sys == PL_COLOR_SYSTEM_XYZ) {
+            // XYZ is decoded in linear light, into the frame's tagged primaries
             pl_shader_linearize(sh, &pass->img.color);
             pass->img.color.transfer = PL_COLOR_TRC_LINEAR;
         }
@@ -2083,6 +2134,7 @@ static bool pass_read_image(struct pass_state *pass)
 #endif
         pl_shader_decode_color_ex(sh, pl_color_decode_args(
             .repr              = &pass->img.repr,
+            .primaries         = pass->img.color.primaries,
             .color_adjustment  = params->color_adjustment,
             .enhancement_layer = el_sh,
         ));
@@ -2300,6 +2352,17 @@ error:
     return NULL;
 }
 
+// Whether this is an XYZ target whose encoding is done by `pass_output_target`
+// in linear light, so that the preceding color mapping may directly produce
+// linear light. (LUTs which operate on the encoded target are excluded)
+static bool target_encodes_linear_xyz(const struct pl_frame *target)
+{
+    if (target->repr.sys != PL_COLOR_SYSTEM_XYZ)
+        return false;
+    enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
+    return lut_type != PL_LUT_CONVERSION && lut_type != PL_LUT_NORMALIZED;
+}
+
 // Transforms image into the output color space (tone-mapping, ICC 3DLUT, etc)
 static void pass_convert_colors(struct pass_state *pass)
 {
@@ -2393,9 +2456,10 @@ static void pass_convert_colors(struct pass_state *pass)
         }
     }
 
+    const bool linear_xyz = target_encodes_linear_xyz(target);
     if (need_conversion) {
         struct pl_color_space target_csp = target->color;
-        if (target->icc)
+        if (target->icc || linear_xyz)
             target_csp.transfer = PL_COLOR_TRC_LINEAR;
 
         if (pass->need_peak_fbo && !img_tex(pass, img))
@@ -2423,6 +2487,8 @@ static void pass_convert_colors(struct pass_state *pass)
         pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
 
     img->color = target->color;
+    if (linear_xyz)
+        img->color.transfer = PL_COLOR_TRC_LINEAR;
 }
 
 // Returns true if error diffusion was successfully performed
@@ -2683,7 +2749,8 @@ static void clear_target(struct pass_state *pass, const pl_tex background,
                  SH_FLOAT(bg_scale));
 
             swizzle_color(sh, plane->components, plane->component_mapping,
-                          params->blend_params, &target->repr);
+                          params->blend_params, &target->repr,
+                          plane->texture->params.format);
 
             pl_dispatch_finish(rr->dp, pl_dispatch_params(
                 .shader         = &sh,
@@ -2711,19 +2778,21 @@ static void translate_srgb_color(float out_color[3], const float in_color[3],
     case PL_COLOR_TRC_GAMMA22:
         // Re-use input transfer curve to avoid small adaptations
         srgb.transfer = csp->transfer;
-        srgb.hdr.min_luma = csp->hdr.min_luma;
         break;
     default:
-        // In all other cases, use infinite contrast sRGB, to avoid unwanted
-        // black level changes
-        srgb.hdr.min_luma = PL_COLOR_HDR_BLACK;
         break;
     }
 
-    // The colors are display-referred, so on SDR targets map sRGB white onto
-    // the target white, regardless of the target's absolute luminance
-    if (!pl_color_transfer_is_hdr(csp->transfer))
+    // The colors are display-referred, so on SDR targets map sRGB extremes
+    // onto the target extremes, regardless of the target's absolute luminance
+    if (!pl_color_transfer_is_hdr(csp->transfer)) {
+        srgb.hdr.min_luma = csp->hdr.min_luma;
         srgb.hdr.max_luma = csp->hdr.max_luma;
+    } else {
+        // On HDR targets, use infinite contrast sRGB instead, to avoid
+        // unwanted black level changes
+        srgb.hdr.min_luma = PL_COLOR_HDR_BLACK;
+    }
 
     memcpy(out_color, in_color, sizeof(float[3]));
     pl_color_linearize(&srgb, out_color);
@@ -2762,39 +2831,45 @@ static bool pass_output_target(struct pass_state *pass)
         }
     }
 
-    if (params->corner_rounding > 0.0f) {
-        const float out_w2 = fabsf(pl_rect_w(target->crop)) / 2.0f;
-        const float out_h2 = fabsf(pl_rect_h(target->crop)) / 2.0f;
-        const float radius = fminf(params->corner_rounding, 1.0f) *
-                             fminf(out_w2, out_h2);
-        const struct pl_rect2df relpos = {
-            .x0 = -out_w2, .y0 = -out_h2,
-            .x1 =  out_w2, .y1 =  out_h2,
-        };
-
+    // Both of these act as an alpha mask applied on top of the image
+    const float opacity = 1.0f - PL_CLAMP(params->transparency, 0.0f, 1.0f);
+    if (params->corner_rounding > 0.0f || opacity < 1.0f) {
         pl_shader sh = img_sh(pass, img);
-        GLSL("float radius = "$";                           \n"
-             "vec2 size2 = vec2("$", "$");                  \n"
-             "vec2 relpos = "$";                            \n"
-             "vec2 rd = abs(relpos) - size2 + vec2(radius); \n"
-             "float rdist = length(max(rd, 0.0)) - radius;  \n"
-             "float border = smoothstep(2.0f, 0.0f, rdist); \n",
-             SH_FLOAT_DYN(radius),
-             SH_FLOAT_DYN(out_w2), SH_FLOAT_DYN(out_h2),
-             sh_attr_vec2(sh, "relpos", &relpos));
+        GLSL("float mask = "$"; \n", SH_FLOAT_DYN(opacity));
+
+        if (params->corner_rounding > 0.0f) {
+            const float out_w2 = fabsf(pl_rect_w(target->crop)) / 2.0f;
+            const float out_h2 = fabsf(pl_rect_h(target->crop)) / 2.0f;
+            const float radius = fminf(params->corner_rounding, 1.0f) *
+                                 fminf(out_w2, out_h2);
+            const struct pl_rect2df relpos = {
+                .x0 = -out_w2, .y0 = -out_h2,
+                .x1 =  out_w2, .y1 =  out_h2,
+            };
+
+            GLSL("float radius = "$";                           \n"
+                 "vec2 size2 = vec2("$", "$");                  \n"
+                 "vec2 relpos = "$";                            \n"
+                 "vec2 rd = abs(relpos) - size2 + vec2(radius); \n"
+                 "float rdist = length(max(rd, 0.0)) - radius;  \n"
+                 "mask *= smoothstep(2.0f, 0.0f, rdist);        \n",
+                 SH_FLOAT_DYN(radius),
+                 SH_FLOAT_DYN(out_w2), SH_FLOAT_DYN(out_h2),
+                 sh_attr_vec2(sh, "relpos", &relpos));
+        }
 
         switch (img->repr.alpha) {
         case PL_ALPHA_UNKNOWN:
         case PL_ALPHA_NONE:
-            GLSL("color.a = border; \n");
+            GLSL("color.a = mask; \n");
             img->repr.alpha = PL_ALPHA_INDEPENDENT;
             img->comps = 4;
             break;
         case PL_ALPHA_INDEPENDENT:
-            GLSL("color.a *= border; \n");
+            GLSL("color.a *= mask; \n");
             break;
         case PL_ALPHA_PREMULTIPLIED:
-            GLSL("color *= border; \n");
+            GLSL("color *= mask; \n");
             break;
         case PL_ALPHA_MODE_COUNT:
             pl_unreachable();
@@ -2880,7 +2955,7 @@ static bool pass_output_target(struct pass_state *pass)
         switch (background) {
         case PL_CLEAR_COLOR:;
             float bg_color[3];
-            translate_srgb_color(bg_color, params->background_color, &target->color);
+            translate_srgb_color(bg_color, params->background_color, &img->color);
             GLSL("color += (1.0 - color.a) * vec4("$", "$", "$", "$"); \n",
                  SH_FLOAT(bg_color[0]),
                  SH_FLOAT(bg_color[1]),
@@ -2895,11 +2970,11 @@ static bool pass_output_target(struct pass_state *pass)
             static const float zero[2][3] = {0};
             float color[2][3];
             if (memcmp(params->tile_colors, zero, sizeof(zero)) == 0) {
-                translate_srgb_color(color[0], pl_render_default_params.tile_colors[0], &target->color);
-                translate_srgb_color(color[1], pl_render_default_params.tile_colors[1], &target->color);
+                translate_srgb_color(color[0], pl_render_default_params.tile_colors[0], &img->color);
+                translate_srgb_color(color[1], pl_render_default_params.tile_colors[1], &img->color);
             } else {
-                translate_srgb_color(color[0], params->tile_colors[0], &target->color);
-                translate_srgb_color(color[1], params->tile_colors[1], &target->color);
+                translate_srgb_color(color[0], params->tile_colors[0], &img->color);
+                translate_srgb_color(color[1], params->tile_colors[1], &img->color);
             }
 
             GLSL("vec2 outcoord = gl_FragCoord.xy * "$";                    \n"
@@ -2935,10 +3010,23 @@ static bool pass_output_target(struct pass_state *pass)
 
     enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
     if (lut_type != PL_LUT_CONVERSION) {
-        pl_shader_encode_color(sh, &repr);
+        if (repr.sys == PL_COLOR_SYSTEM_XYZ &&
+            img->color.transfer != PL_COLOR_TRC_LINEAR)
+        {
+            // XYZ is encoded in linear light
+            pl_shader_linearize(sh, &img->color);
+            img->color.transfer = PL_COLOR_TRC_LINEAR;
+        }
+
+        pl_shader_encode_color_ex(sh, pl_color_encode_args(
+            .repr      = &repr,
+            .primaries = target->color.primaries,
+        ));
+
         if (repr.sys == PL_COLOR_SYSTEM_XYZ) {
-            img->color.transfer = PL_COLOR_TRC_ST428;
-            pl_shader_delinearize(sh, &img->color);
+            // Apply the target transfer function (e.g. ST 428-1) to the XYZ
+            pl_shader_delinearize(sh, &target->color);
+            img->color.transfer = target->color.transfer;
         }
     }
     if (lut_type == PL_LUT_NATIVE)
@@ -3087,7 +3175,8 @@ static bool pass_output_target(struct pass_state *pass)
         }
 
         swizzle_color(sh, plane->components, plane->component_mapping,
-                      params->blend_params, &target->repr);
+                      params->blend_params, &target->repr,
+                      plane->texture->params.format);
 
         pl_rect2d plane_rect = {
             .x0 = flipped_x ? rx1 : rx0,
@@ -3331,15 +3420,38 @@ static void fix_refs_and_rects(struct pass_state *pass)
     };
 }
 
+// For PL_COLOR_SYSTEM_XYZ frames, `color.primaries` denotes the RGB color
+// space that the (device-independent) XYZ tristimulus values are decoded into
+// or encoded from. In particular, this decides which XYZ value is treated as
+// reference white, and thus what chromatic adaptation is applied towards the
+// display. See `pl_color_repr_decode_params.primaries`.
+static void infer_xyz_color(struct pl_color_space *color)
+{
+    if (color->transfer == PL_COLOR_TRC_LINEAR) {
+        // Linear light XYZ (e.g. scene-referred camera data) is D65-referenced
+        // by convention. Honor explicitly tagged primaries, and otherwise
+        // default to a wide D65 gamut, to avoid needlessly limiting the
+        // (unbounded) XYZ gamut during gamut mapping.
+        if (!color->primaries)
+            color->primaries = PL_COLOR_PRIM_BT_2020;
+    } else {
+        // Anything else is assumed to be DCDM X'Y'Z' (SMPTE ST 428-1): a 2.6
+        // gamma encoding mastered on a reference projector with DCI white, so
+        // decode it into DCI-P3 and let the color mapping adapt the DCI white
+        // point towards the display. This deliberately overrides any tagged
+        // primaries, since in practice they are meaningless for DCDM (e.g.
+        // BT.709 fallbacks, or lavu's mapping of ST 428-1 to CIE 1931 RGB).
+        color->primaries = PL_COLOR_PRIM_DCI_P3;
+        color->transfer = PL_COLOR_TRC_ST428;
+    }
+}
+
 static void fix_frame(struct pl_frame *frame)
 {
     pl_tex tex = frame->planes[frame_ref(frame)].texture;
 
-    if (frame->repr.sys == PL_COLOR_SYSTEM_XYZ) {
-        // XYZ is implicity converted to linear DCI-P3 in pl_color_repr_decode
-        frame->color.primaries = PL_COLOR_PRIM_DCI_P3;
-        frame->color.transfer = PL_COLOR_TRC_ST428;
-    }
+    if (frame->repr.sys == PL_COLOR_SYSTEM_XYZ)
+        infer_xyz_color(&frame->color);
 
     // If the primaries are not known, guess them based on the resolution
     if (tex && !frame->color.primaries)
@@ -3628,11 +3740,33 @@ done:
     return true;
 }
 
+static const struct pl_render_params *
+fix_params(struct pl_render_params *out, const struct pl_render_params *params)
+{
+    *out = *PL_DEF(params, &pl_render_default_params);
+
+    const struct pl_deband_params    *deband  = out->deband_params;
+    const struct pl_color_adjustment *adjust  = out->color_adjustment;
+    const struct pl_cone_params      *cones   = out->cone_params;
+    const struct pl_distort_params   *distort = out->distort_params;
+    if (deband && !deband->iterations && !deband->grain)
+        out->deband_params = NULL;
+    if (adjust && !memcmp(adjust, &pl_color_adjustment_neutral, sizeof(*adjust)))
+        out->color_adjustment = NULL;
+    if (cones && (!cones->cones || cones->strength == 1.0f))
+        out->cone_params = NULL;
+    if (distort && !memcmp(distort, &pl_distort_default_params, sizeof(*distort)))
+        out->distort_params = NULL;
+
+    return out;
+}
+
 bool pl_render_image(pl_renderer rr, const struct pl_frame *pimage,
                      const struct pl_frame *ptarget,
                      const struct pl_render_params *params)
 {
-    params = PL_DEF(params, &pl_render_default_params);
+    struct pl_render_params fixed;
+    params = fix_params(&fixed, params);
     pl_dispatch_mark_dynamic(rr->dp, params->dynamic_constants);
     if (!pimage)
         return draw_empty_overlays(rr, ptarget, params);
@@ -3690,9 +3824,9 @@ const struct pl_frame *pl_frame_mix_nearest(const struct pl_frame_mix *mix)
         return NULL;
 
     const struct pl_frame *best = mix->frames[0];
-    float best_dist = fabsf(mix->timestamps[0]);
+    double best_dist = fabs(mix->timestamps[0]);
     for (int i = 1; i < mix->num_frames; i++) {
-        float dist = fabsf(mix->timestamps[i]);
+        double dist = fabs(mix->timestamps[i]);
         if (dist < best_dist) {
             best = mix->frames[i];
             best_dist = dist;
@@ -3795,6 +3929,7 @@ static struct params_info render_params_info(const struct pl_render_params *para
     CLEAR(params.error_diffusion);
     CLEAR(params.force_dither);
     CLEAR(params.corner_rounding);
+    CLEAR(params.transparency);
 
     // Clear out other irrelevant fields
     CLEAR(params.dynamic_constants);
@@ -3814,7 +3949,8 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
     if (!images->num_frames)
         return pl_render_image(rr, NULL, ptarget, params);
 
-    params = PL_DEF(params, &pl_render_default_params);
+    struct pl_render_params fixed;
+    params = fix_params(&fixed, params);
     struct params_info par_info = render_params_info(params);
     pl_dispatch_mark_dynamic(rr->dp, params->dynamic_constants);
 
@@ -4134,11 +4270,12 @@ inter_pass_error:
     // With a single frame there is nothing to mix, so we can skip the
     // linearize/delinearize roundtrip.
     bool mixing = fidx > 1;
+    bool linear_xyz = target_encodes_linear_xyz(target);
     struct pl_color_space mix_csp = target->color;
-    if (mixing) {
+    if (mixing || linear_xyz)
         mix_csp.transfer = PL_COLOR_TRC_LINEAR;
+    if (mixing)
         GLSL("vec4 mix_color = vec4(0.0); \n");
-    }
 
     int comps = 0;
     for (int i = 0; i < fidx; i++) {
@@ -4188,7 +4325,7 @@ inter_pass_error:
         .w = out_w,
         .h = out_h,
         .comps = comps,
-        .color = target->color,
+        .color = linear_xyz ? mix_csp : target->color,
         .rect = { 0, 0, out_w, out_h },
         .repr = {
             .sys = PL_COLOR_SYSTEM_RGB,
@@ -4293,6 +4430,13 @@ void pl_frame_from_swapchain(struct pl_frame *out_frame,
     };
 }
 
+void pl_frame_size(const struct pl_frame *frame, int *w, int *h)
+{
+    pl_tex ref = frame->planes[frame_ref(frame)].texture;
+    *w = ref->params.w;
+    *h = ref->params.h;
+}
+
 bool pl_frame_is_cropped(const struct pl_frame *frame)
 {
     int x0 = roundf(PL_MIN(frame->crop.x0, frame->crop.x1)),
@@ -4300,29 +4444,50 @@ bool pl_frame_is_cropped(const struct pl_frame *frame)
         x1 = roundf(PL_MAX(frame->crop.x0, frame->crop.x1)),
         y1 = roundf(PL_MAX(frame->crop.y0, frame->crop.y1));
 
-    pl_tex ref = frame->planes[frame_ref(frame)].texture;
-    pl_assert(ref);
+    int ref_w, ref_h;
+    pl_frame_size(frame, &ref_w, &ref_h);
 
     if (!x0 && !x1)
-        x1 = ref->params.w;
+        x1 = ref_w;
     if (!y0 && !y1)
-        y1 = ref->params.h;
+        y1 = ref_h;
 
-    return x0 > 0 || y0 > 0 || x1 < ref->params.w || y1 < ref->params.h;
+    return x0 > 0 || y0 > 0 || x1 < ref_w || y1 < ref_h;
+}
+
+// Encodes an sRGB color into the frame's native color representation
+static void encode_srgb_color(float out_color[3], const float in_color[3],
+                              const struct pl_frame *frame)
+{
+    struct pl_color_repr repr = frame->repr;
+    struct pl_color_space color = frame->color;
+    if (repr.sys == PL_COLOR_SYSTEM_XYZ)
+        infer_xyz_color(&color);
+
+    pl_transform3x3 tr = pl_color_repr_decode_ex(&repr, pl_color_repr_decode_params(
+        .primaries = color.primaries,
+    ));
+    pl_transform3x3_invert(&tr);
+
+    if (frame->repr.sys == PL_COLOR_SYSTEM_XYZ) {
+        // XYZ is encoded in linear light
+        struct pl_color_space linear = color;
+        linear.transfer = PL_COLOR_TRC_LINEAR;
+        translate_srgb_color(out_color, in_color, &linear);
+        pl_transform3x3_apply(&tr, out_color);
+        pl_color_delinearize(&color, out_color);
+    } else {
+        translate_srgb_color(out_color, in_color, &color);
+        pl_transform3x3_apply(&tr, out_color);
+    }
 }
 
 void pl_frame_clear_tiles(pl_gpu gpu, const struct pl_frame *frame,
                           const float tile_colors[2][3], int tile_size)
 {
-    struct pl_color_repr repr = frame->repr;
-    pl_transform3x3 tr = pl_color_repr_decode(&repr, NULL);
-    pl_transform3x3_invert(&tr);
-
     float encoded[2][3];
-    for (int i = 0; i < PL_ARRAY_SIZE(encoded); i++) {
-        translate_srgb_color(encoded[i], tile_colors[i], &frame->color);
-        pl_transform3x3_apply(&tr, encoded[i]);
-    }
+    for (int i = 0; i < PL_ARRAY_SIZE(encoded); i++)
+        encode_srgb_color(encoded[i], tile_colors[i], frame);
 
     pl_tex ref = frame->planes[frame_ref(frame)].texture;
 
@@ -4367,13 +4532,8 @@ void pl_frame_clear_tiles(pl_gpu gpu, const struct pl_frame *frame,
 void pl_frame_clear_rgba(pl_gpu gpu, const struct pl_frame *frame,
                          const float rgba[4])
 {
-    struct pl_color_repr repr = frame->repr;
-    pl_transform3x3 tr = pl_color_repr_decode(&repr, NULL);
-    pl_transform3x3_invert(&tr);
-
     float encoded[3];
-    translate_srgb_color(encoded, rgba, &frame->color);
-    pl_transform3x3_apply(&tr, encoded);
+    encode_srgb_color(encoded, rgba, frame);
 
     float mult = frame->repr.alpha == PL_ALPHA_PREMULTIPLIED ? rgba[3] : 1.0;
     for (int p = 0; p < frame->num_planes; p++) {
@@ -4401,6 +4561,9 @@ struct pl_render_errors pl_renderer_get_errors(pl_renderer rr)
 void pl_renderer_reset_errors(pl_renderer rr,
                               const struct pl_render_errors *errors)
 {
+    if (!rr)
+        return;
+
     if (!errors) {
         // Reset everything
         rr->errors = PL_RENDER_ERR_NONE;

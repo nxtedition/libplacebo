@@ -3,6 +3,39 @@
 The following provides an overview of all options available via the built-in
 `pl_options` system.
 
+## Syntax
+
+Options are given as `key=value` pairs. `pl_options_load` accepts any number of
+them in a single string, separated by spaces, newlines, commas (`,`),
+semicolons (`;`) or colons (`:`):
+
+```
+upscaler=ewa_lanczossharp,downscaler=hermite,deband=yes
+```
+
+Values are parsed and printed locale-invariantly, so a string produced by
+`pl_options_save` always loads back identically, on any machine.
+
+Options belonging to a nested struct (`PL_OPT_STRUCT`) are addressed by their
+full path, with each component separated by a `.`. For example, an option list
+exposing a `pl_color_space` under the key `color` would accept:
+
+```
+color.transfer=pq,color.hdr.max_luma=1000
+```
+
+Such a path works anywhere a plain key does: `pl_options_set_str`,
+`pl_options_get` and `pl_find_option` all take one, and `pl_options_iterate`
+reports one back through `pl_opt_data.path`. Note that `pl_opt_t.key` only ever
+holds the final component.
+
+!!! note "`pl_options` itself is flat"
+    The option list documented below is deliberately *not* nested. Although
+    `pl_options` stores its settings in sub-structs such as
+    `pl_deband_params`, every option is reachable by a single top-level key
+    (e.g. `deband_iterations`, not `deband_params.iterations`). This is to
+    preserve backwards compatibility with older configuration files.
+
 ## Global preset
 
 ### `preset=<default|fast|high_quality>`
@@ -46,7 +79,6 @@ Sets the filter used for downscaling. Defaults to `hermite`. Pass
 roughly ordered from fastest to slowest:
 
 - `none`: Use the same filter as specified for `upscaler`
-- `box`: Box averaging (very fast)
 - `hermite`: Hermite-weighted averaging (fast)
 - `bilinear`: Bilinear (triangle) averaging (fast)
 - `bicubic`: Bicubic interpolation (fast)
@@ -883,6 +915,11 @@ If set to a value above `0.0`, the output will be rendered with rounded
 corners, as if an alpha transparency mask had been applied. The value indicates
 the relative fraction of the side length to round - a value of `1.0` rounds the
 corners as much as possible. Defaults to `0.0`.
+
+### `transparency=<0.0..1.0>`
+
+The (inverted) alpha value of the image itself, multiplied on top of any alpha
+channel it already has. Defaults to `0.0`.
 
 ### `blend_against_tiles=<yes|no>`
 

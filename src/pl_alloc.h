@@ -165,6 +165,8 @@ char *pl_strndup0(void *parent, const char *str, size_t size);
             _idx += (arr).num;                                                  \
         size_t _count = (count);                                                \
         assert(_idx >= 0 && _idx + _count <= (arr).num);                        \
+        if (!_count)                                                            \
+            break;                                                              \
         memmove(&(arr).elem[_idx], &(arr).elem[_idx + _count],                  \
                 ((arr).num - _idx - _count) * sizeof((arr).elem[0]));           \
         (arr).num -= _count;                                                    \
@@ -198,4 +200,11 @@ char *pl_strndup0(void *parent, const char *str, size_t size);
         PL_ARRAY_APPEND(parent, _arr, __VA_ARGS__);                             \
         (arr) = _arr.elem;                                                      \
         (idxvar) = _arr.num;                                                    \
+    } while (0)
+
+#define PL_ARRAY_REMOVE_AT_RAW(arr, numvar, idx)                                \
+    do {                                                                        \
+        PL_ARRAY(__typeof__((arr)[0])) _arr = { (arr), (numvar) };              \
+        PL_ARRAY_REMOVE_AT(_arr, idx);                                          \
+        (numvar) = _arr.num;                                                    \
     } while (0)

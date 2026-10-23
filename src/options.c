@@ -20,7 +20,10 @@
 #include "common.h"
 #include "log.h"
 
+#include <libplacebo/compositor.h>
 #include <libplacebo/options.h>
+
+#include "options.h"
 
 struct priv {
     pl_log log;
@@ -36,7 +39,7 @@ struct priv {
     PL_ARRAY(const struct pl_hook *) hooks;
 };
 
-static const struct pl_options_t defaults = {
+static const struct pl_options_t default_options = {
     .params             = { PL_RENDER_DEFAULTS },
     .deband_params      = { PL_DEBAND_DEFAULTS },
     .sigmoid_params     = { PL_SIGMOID_DEFAULTS },
@@ -117,7 +120,7 @@ static inline void redirect_params(pl_options opts)
 
 void pl_options_reset(pl_options opts, const struct pl_render_params *preset)
 {
-    *opts = defaults;
+    *opts = default_options;
     if (preset)
         opts->params = *preset;
     redirect_params(opts);
@@ -208,7 +211,8 @@ typedef const struct opt_ctx_t {
     pl_log log; // as a convenience, only needed when parsing
     pl_opt opt;
     void *alloc; // for printing only
-    pl_options opts; // current base ptr
+    void *base; // top-level struct base ptr
+    const char *path; // current path
 } *opt_ctx;
 
 struct enum_val {
@@ -239,18 +243,58 @@ typedef const struct opt_priv_t {
     size_t offset_params; // offset of actual struct (for params toggles)
 } *opt_priv;
 
-static pl_opt_data get_opt_data(opt_ctx ctx)
+// Returns the offset of the option relative to the struct base
+static pl_opt resolve(const struct pl_opt_t *list, pl_str path,
+                      ptrdiff_t *out_offset)
 {
-    pl_options opts = ctx->opts;
+    ptrdiff_t offset = 0;
+
+    while (path.len) {
+        pl_str rest;
+        pl_str key = pl_str_split_char(path, '.', &rest);
+
+        pl_opt match = NULL;
+        for (pl_opt opt = list; opt->key; opt++) {
+            if (pl_str_equals0(key, opt->key)) {
+                match = opt;
+                break;
+            }
+        }
+
+        if (!match)
+            break;
+
+        opt_priv priv = match->priv;
+        offset += priv->offset;
+
+        if (match->type == PL_OPT_STRUCT) {
+            list = match->fields;
+            path = rest;
+            continue;
+        } else if (rest.len) {
+            break; // path continues past leaf option
+        }
+
+        if (out_offset)
+            *out_offset = offset;
+        return match;
+    }
+
+    return NULL;
+}
+
+static pl_opt_data get_opt_data(opt_ctx ctx, const void *val)
+{
+    pl_options opts = ctx->base;
     struct priv *p = PL_PRIV(opts);
     opt_priv priv = ctx->opt->priv;
-    const void *val = (void *) ((uintptr_t) opts + priv->offset);
 
     p->data_text.len = 0;
     priv->print(ctx, &p->data_text, val);
     p->data = (struct pl_opt_data_t) {
         .opts  = opts,
         .opt   = ctx->opt,
+        .path  = PL_DEF(ctx->path, ctx->opt->key),
         .value = val,
         .text  = (char *) p->data_text.buf,
     };
@@ -262,52 +306,77 @@ pl_opt_data pl_options_get(pl_options opts, const char *key)
 {
     struct priv *p = PL_PRIV(opts);
 
-    pl_opt opt = pl_find_option(key);
+    ptrdiff_t offset;
+    pl_opt opt = resolve(pl_option_list, pl_str0(key), &offset);
     if (!opt || opt->preset) {
         PL_ERR(p, "Unrecognized or invalid option '%s'", key);
         return NULL;
     }
 
-    return get_opt_data(&(struct opt_ctx_t) {
+    struct opt_ctx_t ctx = {
         .alloc = opts,
-        .opts  = opts,
+        .base  = opts,
         .opt   = opt,
-    });
+        .path  = key,
+    };
+
+    return get_opt_data(&ctx, (const char *) opts + offset);
+}
+
+static void iterate(struct opt_ctx_t *ctx, const struct pl_opt_t *list,
+                    ptrdiff_t base, char *buf, int size,
+                    void (*cb)(void *priv, pl_opt_data data),
+                    void *cb_priv)
+{
+    for (pl_opt opt = list; opt->key; opt++) {
+        if (opt->preset)
+            continue;
+
+        opt_priv priv = opt->priv;
+        ptrdiff_t offset = base + priv->offset;
+
+        const char *sep = opt->type == PL_OPT_STRUCT ? "." : "";
+        const int n = snprintf(buf, size, "%s%s", opt->key, sep);
+        pl_assert(n > 0 && n < size);
+
+        if (opt->type == PL_OPT_STRUCT) {
+            iterate(ctx, opt->fields, offset, buf + n, size - n, cb, cb_priv);
+            continue;
+        }
+
+        ctx->opt = opt;
+
+        const void *val = (const char *) ctx->base + offset;
+        const void *ref = (const char *) &default_options + offset;
+        int cmp = priv->compare ? priv->compare(ctx, val, ref)
+                                : memcmp(val, ref, priv->size);
+        if (cmp != 0)
+            cb(cb_priv, get_opt_data(ctx, val));
+    }
 }
 
 void pl_options_iterate(pl_options opts,
                         void (*cb)(void *priv, pl_opt_data data),
                         void *cb_priv)
 {
-    for (pl_opt opt = pl_option_list; opt->key; opt++) {
-        if (opt->preset)
-            continue;
+    char path[256];
+    struct opt_ctx_t ctx = {
+        .alloc = opts,
+        .base  = opts,
+        .path  = path,
+    };
 
-        struct opt_ctx_t ctx = {
-            .alloc = opts,
-            .opts  = opts,
-            .opt   = opt,
-        };
-
-        opt_priv priv = opt->priv;
-        const void *val = (void *) ((uintptr_t) opts + priv->offset);
-        const void *ref = (void *) ((uintptr_t) &defaults + priv->offset);
-        int cmp = priv->compare ? priv->compare(&ctx, val, ref)
-                                : memcmp(val, ref, priv->size);
-        if (cmp != 0)
-            cb(cb_priv, get_opt_data(&ctx));
-    }
+    iterate(&ctx, pl_option_list, 0, path, sizeof(path), cb, cb_priv);
 }
 
 static void save_cb(void *priv, pl_opt_data data)
 {
-    pl_opt opt = data->opt;
     void *alloc = data->opts;
     pl_str *out = priv;
 
     if (out->len)
         pl_str_append_raw(alloc, out, ",", 1);
-    pl_str_append_raw(alloc, out, opt->key, strlen(opt->key));
+    pl_str_append(alloc, out, pl_str0(data->path));
     pl_str_append_raw(alloc, out, "=", 1);
     pl_str_append(alloc, out, pl_str0(data->text));
 }
@@ -321,36 +390,57 @@ const char *pl_options_save(pl_options opts)
     return p->saved.len ? (char *) p->saved.buf : "";
 }
 
-static bool option_set_raw(pl_options opts, pl_str k, pl_str v)
+void *pl_opt_field(pl_opt opt, void *base)
 {
-    struct priv *p = PL_PRIV(opts);
-    k = pl_str_strip(k);
-    v = pl_str_strip(v);
+    opt_priv priv = opt->priv;
+    return (char *) base + priv->offset;
+}
 
-    pl_opt opt;
-    for (opt = pl_option_list; opt->key; opt++) {
-        if (pl_str_equals0(k, opt->key))
-            goto found;
-    }
+size_t pl_opt_size(pl_opt opt)
+{
+    opt_priv priv = opt->priv;
+    return priv->size;
+}
 
-    PL_ERR(p, "Unrecognized option '%.*s', in '%.*s=%.*s'",
-           PL_STR_FMT(k), PL_STR_FMT(k), PL_STR_FMT(v));
-    return false;
-
-found:
-    PL_TRACE(p, "Parsing option '%s' = '%.*s'", opt->key, PL_STR_FMT(v));
+bool pl_opt_parse(pl_log log, void *base, pl_opt opt, void *field, pl_str value)
+{
+    pl_assert(opt->type != PL_OPT_STRUCT);
+    pl_msg(log, PL_LOG_TRACE, "Parsing option '%s' = '%.*s'",
+           opt->key, PL_STR_FMT(value));
     if (opt->deprecated)
-        PL_WARN(p, "Option '%s' is deprecated", opt->key);
+        pl_msg(log, PL_LOG_WARN, "Option '%s' is deprecated", opt->key);
 
     struct opt_ctx_t ctx = {
-        .log  = p->log,
-        .opts = opts,
+        .log  = log,
+        .base = base,
         .opt  = opt,
     };
 
     opt_priv priv = opt->priv;
-    void *val = (void *) ((uintptr_t) opts + priv->offset);
-    return priv->parse(&ctx, v, val);
+    return priv->parse(&ctx, value, field);
+}
+
+bool pl_options_set_str_ex(pl_log log, void *base, const struct pl_opt_t *list,
+                           pl_str k, pl_str v)
+{
+    k = pl_str_strip(k);
+    v = pl_str_strip(v);
+
+    ptrdiff_t offset;
+    pl_opt opt = resolve(list, k, &offset);
+    if (!opt) {
+        pl_msg(log, PL_LOG_ERR, "Unrecognized option '%.*s', in '%.*s=%.*s'",
+               PL_STR_FMT(k), PL_STR_FMT(k), PL_STR_FMT(v));
+        return false;
+    }
+
+    return pl_opt_parse(log, base, opt, (char *) base + offset, v);
+}
+
+static bool option_set_raw(pl_options opts, pl_str k, pl_str v)
+{
+    struct priv *p = PL_PRIV(opts);
+    return pl_options_set_str_ex(p->log, opts, pl_option_list, k, v);
 }
 
 bool pl_options_set_str(pl_options opts, const char *key, const char *value)
@@ -451,38 +541,14 @@ static void print_float(opt_ctx p, pl_str *out, const void *ptr)
     pl_str_append_asprintf_c(p->alloc, out, "%f", *val);
 }
 
-static bool parse_fraction(pl_str str, float *val)
-{
-    pl_str denom, num = pl_str_split_char(str, '/', &denom);
-    float n, d;
-    bool ok = denom.buf && denom.len && pl_str_parse_float(num, &n) &&
-                                        pl_str_parse_float(denom, &d);
-    if (ok)
-        *val = n / d;
-    return ok;
-}
-
 static bool parse_float(opt_ctx p, pl_str str, void *out)
 {
     pl_opt opt = p->opt;
     float val;
-    if (!parse_fraction(str, &val) && !pl_str_parse_float(str, &val)) {
-        PL_ERR(p, "Invalid value '%.*s' for option '%s', expected floating point "
-                  "or fraction", PL_STR_FMT(str), opt->key);
+    if (!pl_str_parse_float_fraction(str, &val)) {
+        PL_ERR(p, "Invalid value '%.*s' for option '%s', expected floating "
+               "point or finite fraction", PL_STR_FMT(str), opt->key);
         return false;
-    }
-
-    switch (fpclassify(val)) {
-    case FP_NAN:
-    case FP_INFINITE:
-    case FP_SUBNORMAL:
-        PL_ERR(p, "Invalid value '%f' for option '%s', non-normal float",
-               val, opt->key);
-        return false;
-
-    case FP_ZERO:
-    case FP_NORMAL:
-        break;
     }
 
     if (opt->min != opt->max) {
@@ -494,6 +560,33 @@ static bool parse_float(opt_ctx p, pl_str str, void *out)
     }
 
     *(float *) out = val;
+    return true;
+}
+
+static void print_double(opt_ctx p, pl_str *out, const void *ptr)
+{
+    pl_str_append_asprintf_c(p->alloc, out, "%f", *(const double *) ptr);
+}
+
+static bool parse_double(opt_ctx p, pl_str str, void *out)
+{
+    pl_opt opt = p->opt;
+    double val;
+    if (!pl_str_parse_double_fraction(str, &val)) {
+        PL_ERR(p, "Invalid value '%.*s' for option '%s', expected floating "
+               "point or finite fraction", PL_STR_FMT(str), opt->key);
+        return false;
+    }
+
+    if (opt->min != opt->max) {
+        if (val < opt->min || val > opt->max) {
+            PL_ERR(p, "Value of %f out of range for option '%s': [%.2f, %.2f]",
+                   val, opt->key, opt->min, opt->max);
+            return false;
+        }
+    }
+
+    *(double *) out = val;
     return true;
 }
 
@@ -519,7 +612,7 @@ static bool parse_params(opt_ctx p, pl_str str, void *out)
     if (!parse_bool(p, str, &set))
         return false;
     if (set) {
-        *res = (const void *) ((uintptr_t) p->opts + priv->offset_params);
+        *res = (const void *) ((uintptr_t) p->base + priv->offset_params);
     } else {
         *res = NULL;
     }
@@ -572,7 +665,7 @@ static bool parse_preset(opt_ctx p, pl_str str, void *out)
                 // Redirect params structs into internal system after loading
                 struct pl_render_params *params = out, prev = *params;
                 *params = *preset;
-                redirect_params(p->opts);
+                redirect_params(p->base);
 
                 // Re-apply excluded options
                 params->lut = prev.lut;
@@ -673,7 +766,7 @@ static bool parse_scaler(opt_ctx p, pl_str str, void *out)
         *res = NULL;
         return true;
     } else if (pl_str_equals0(str, "custom")) {
-        *res = (void *) ((uintptr_t) p->opts + priv->offset_params);
+        *res = (void *) ((uintptr_t) p->base + priv->offset_params);
         return true;
     }
 
@@ -727,6 +820,8 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
     return false;
 }
 
+#define SIZEOF(FIELD) sizeof((*(STRUCT_BASE *) NULL).FIELD)
+
 #define OPT_BOOL(KEY, NAME, FIELD, ...)                                         \
     {                                                                           \
         .key  = KEY,                                                            \
@@ -735,10 +830,10 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .priv = &(struct opt_priv_t) {                                          \
             .print  = print_bool,                                               \
             .parse  = parse_bool,                                               \
-            .offset = offsetof(struct pl_options_t, FIELD),                     \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
             .size   = sizeof(struct {                                           \
                 bool dummy;                                                     \
-                pl_static_assert(sizeof(defaults.FIELD) == sizeof(bool));       \
+                pl_static_assert(SIZEOF(FIELD) == sizeof(bool));                \
             }),                                                                 \
         },                                                                      \
         __VA_ARGS__                                                             \
@@ -752,10 +847,10 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .priv = &(struct opt_priv_t) {                                          \
             .print  = print_int,                                                \
             .parse  = parse_int,                                                \
-            .offset = offsetof(struct pl_options_t, FIELD),                     \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
             .size   = sizeof(struct {                                           \
                 int dummy;                                                      \
-                pl_static_assert(sizeof(defaults.FIELD) == sizeof(int));        \
+                pl_static_assert(SIZEOF(FIELD) == sizeof(int));                 \
             }),                                                                 \
         },                                                                      \
         __VA_ARGS__                                                             \
@@ -769,10 +864,10 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .priv = &(struct opt_priv_t) {                                          \
             .print  = print_float,                                              \
             .parse  = parse_float,                                              \
-            .offset = offsetof(struct pl_options_t, FIELD),                     \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
             .size   = sizeof(struct {                                           \
                 float dummy;                                                    \
-                pl_static_assert(sizeof(defaults.FIELD) == sizeof(float));      \
+                pl_static_assert(SIZEOF(FIELD) == sizeof(float));               \
             }),                                                                 \
         },                                                                      \
         __VA_ARGS__                                                             \
@@ -787,11 +882,28 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
             .compare       = compare_params,                                    \
             .print         = print_params,                                      \
             .parse         = parse_params,                                      \
-            .offset        = offsetof(struct pl_options_t, params.PARAMS),      \
-            .offset_params = offsetof(struct pl_options_t, PARAMS),             \
+            .offset        = offsetof(STRUCT_BASE, params.PARAMS),              \
+            .offset_params = offsetof(STRUCT_BASE, PARAMS),                     \
             .size          = sizeof(struct {                                    \
                 void *dummy;                                                    \
-                pl_static_assert(sizeof(defaults.params.PARAMS) == sizeof(void*));\
+                pl_static_assert(SIZEOF(params.PARAMS) == sizeof(void*));       \
+            }),                                                                 \
+        },                                                                      \
+        __VA_ARGS__                                                             \
+    }
+
+#define OPT_DOUBLE(KEY, NAME, FIELD, ...)                                       \
+    {                                                                           \
+        .key  = KEY,                                                            \
+        .name = NAME,                                                           \
+        .type = PL_OPT_FLOAT,                                                   \
+        .priv = &(struct opt_priv_t) {                                          \
+            .print  = print_double,                                             \
+            .parse  = parse_double,                                             \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
+            .size   = sizeof(struct {                                           \
+                double dummy;                                                   \
+                pl_static_assert(SIZEOF(FIELD) == sizeof(double));              \
             }),                                                                 \
         },                                                                      \
         __VA_ARGS__                                                             \
@@ -805,10 +917,10 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .priv = &(struct opt_priv_t) {                                          \
             .print  = print_enum,                                               \
             .parse  = parse_enum,                                               \
-            .offset = offsetof(struct pl_options_t, FIELD),                     \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
             .size   = sizeof(struct {                                           \
                 unsigned dummy;                                                 \
-                pl_static_assert(sizeof(defaults.FIELD) == sizeof(unsigned));   \
+                pl_static_assert(SIZEOF(FIELD) == sizeof(unsigned));            \
             }),                                                                 \
             .values = (struct enum_val[]) { VALUES }                            \
         },                                                                      \
@@ -823,8 +935,8 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .preset = true,                                                         \
         .priv   = &(struct opt_priv_t) {                                        \
             .parse   = parse_preset,                                            \
-            .offset  = offsetof(struct pl_options_t, PARAMS),                   \
-            .size    = sizeof(defaults.PARAMS),                                 \
+            .offset  = offsetof(STRUCT_BASE, PARAMS),                           \
+            .size    = SIZEOF(PARAMS),                                          \
             .presets = (struct preset[]) { PRESETS },                           \
         },                                                                      \
         __VA_ARGS__                                                             \
@@ -838,12 +950,12 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .priv = &(struct opt_priv_t) {                                          \
             .print  = print_named,                                              \
             .parse  = parse_named,                                              \
-            .offset = offsetof(struct pl_options_t, FIELD),                     \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
             .names  = (const struct named * const * ) NAMES,                    \
             .size   = sizeof(struct {                                           \
                 const struct named *dummy;                                      \
                 pl_static_assert(offsetof(__typeof__(*NAMES[0]), name) == 0);   \
-                pl_static_assert(sizeof(defaults.FIELD) ==                      \
+                pl_static_assert(SIZEOF(FIELD) ==                               \
                                  sizeof(const struct named *));                 \
             }),                                                                 \
         },                                                                      \
@@ -858,11 +970,11 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .priv = &(struct opt_priv_t) {                                          \
             .print         = print_scaler,                                      \
             .parse         = parse_scaler,                                      \
-            .offset        = offsetof(struct pl_options_t, params.SCALER),      \
-            .offset_params = offsetof(struct pl_options_t, SCALER),             \
+            .offset        = offsetof(STRUCT_BASE, params.SCALER),              \
+            .offset_params = offsetof(STRUCT_BASE, SCALER),                     \
             .size          = sizeof(struct {                                    \
                 const struct pl_filter_config *dummy;                           \
-                pl_static_assert(sizeof(defaults.SCALER) ==                     \
+                pl_static_assert(SIZEOF(SCALER) ==                              \
                                  sizeof(struct pl_filter_config));              \
             }),                                                                 \
         },                                                                      \
@@ -877,17 +989,45 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
         .preset = true,                                                         \
         .priv   = &(struct opt_priv_t) {                                        \
             .parse         = parse_scaler_preset,                               \
-            .offset        = offsetof(struct pl_options_t, SCALER),             \
+            .offset        = offsetof(STRUCT_BASE, SCALER),                     \
             .size          = sizeof(struct {                                    \
                 struct pl_filter_config dummy;                                  \
-                pl_static_assert(sizeof(defaults.SCALER) ==                     \
+                pl_static_assert(SIZEOF(SCALER) ==                              \
                                  sizeof(struct pl_filter_config));              \
             }),                                                                 \
         },                                                                      \
         __VA_ARGS__                                                             \
     }
 
+#define OPT_STRUCT(KEY, NAME, FIELD, LIST, ...)                                 \
+    {                                                                           \
+        .key        = KEY,                                                      \
+        .name       = NAME,                                                     \
+        .type       = PL_OPT_STRUCT,                                            \
+        .fields     = LIST,                                                     \
+        .num_fields = PL_ARRAY_SIZE(LIST) - 1,                                  \
+        .priv = &(struct opt_priv_t) {                                          \
+            .offset = offsetof(STRUCT_BASE, FIELD),                             \
+            .size   = SIZEOF(FIELD),                                            \
+        },                                                                      \
+        __VA_ARGS__                                                             \
+    }
+
 #define LIST(...) __VA_ARGS__, {0}
+
+#define ROUND_VALUES LIST(                                                      \
+    {"nearest", PL_PTS_ROUND_NEAREST},                                          \
+    {"up",      PL_PTS_ROUND_UP},                                               \
+    {"down",    PL_PTS_ROUND_DOWN})
+
+#define CHROMA_VALUES LIST(                                                     \
+    {"auto",          PL_CHROMA_UNKNOWN},                                       \
+    {"left",          PL_CHROMA_LEFT},                                          \
+    {"center",        PL_CHROMA_CENTER},                                        \
+    {"top-left",      PL_CHROMA_TOP_LEFT},                                      \
+    {"top-center",    PL_CHROMA_TOP_CENTER},                                    \
+    {"bottom-left",   PL_CHROMA_BOTTOM_LEFT},                                   \
+    {"bottom-center", PL_CHROMA_BOTTOM_CENTER})
 
 #define SCALE_OPTS(PREFIX, NAME, FIELD)                                               \
     OPT_SCALER(PREFIX, NAME, FIELD),                                                  \
@@ -906,6 +1046,7 @@ static bool parse_scaler_preset(opt_ctx p, pl_str str, void *out)
     OPT_BOOL(PREFIX"_polar", NAME" polar", FIELD.polar)
 
 const struct pl_opt_t pl_option_list[] = {
+#define STRUCT_BASE struct pl_options_t
     OPT_PRESET("preset", "Global preset", params, LIST(
                {"default",      &pl_render_default_params},
                {"fast",         &pl_render_fast_params},
@@ -1001,6 +1142,8 @@ const struct pl_opt_t pl_option_list[] = {
              {"hdr10",     PL_HDR_METADATA_HDR10},
              {"hdr10plus", PL_HDR_METADATA_HDR10PLUS},
              {"cie_y",     PL_HDR_METADATA_CIE_Y})),
+    OPT_FLOAT("mastering_clip", "Mastering peak soft clip strength", color_map_params.mastering_clip, .max = 1.0),
+    OPT_FLOAT("film_strength", "Film response strength", color_map_params.film_strength, .max = 2.0),
     OPT_INT("tone_lut_size", "Tone mapping LUT size", color_map_params.lut_size, .max = 4096),
     OPT_FLOAT("contrast_recovery", "HDR contrast recovery strength", color_map_params.contrast_recovery, .max = 2.0),
     OPT_FLOAT("contrast_smoothness", "HDR contrast recovery smoothness", color_map_params.contrast_smoothness, .min = 1.0, .max = 32.0),
@@ -1138,6 +1281,7 @@ const struct pl_opt_t pl_option_list[] = {
     OPT_FLOAT("background_transparency", "Background color transparency", params.background_transparency, .max = 1),
     OPT_BOOL("skip_target_clearing", "Skip target clearing", params.skip_target_clearing, .deprecated = true),
     OPT_FLOAT("corner_rounding", "Corner rounding", params.corner_rounding, .max = 1.0),
+    OPT_FLOAT("transparency", "Image transparency", params.transparency, .max = 1.0),
     OPT_BOOL("blend_against_tiles", "Blend against tiles", params.blend_against_tiles, .deprecated = true),
     OPT_FLOAT("tile_color_hi_r", "Bright tile R", params.tile_colors[0][0], .max = 1.0),
     OPT_FLOAT("tile_color_hi_g", "Bright tile G", params.tile_colors[0][1], .max = 1.0),
@@ -1164,16 +1308,162 @@ const struct pl_opt_t pl_option_list[] = {
     OPT_BOOL("force_low_bit_depth_fbos", "Force 8-bit FBOs", params.force_low_bit_depth_fbos),
     OPT_BOOL("dynamic_constants", "Dynamic constants", params.dynamic_constants),
     {0},
+#undef STRUCT_BASE
 };
 
 const int pl_option_count = PL_ARRAY_SIZE(pl_option_list) - 1;
 
+static const struct pl_opt_t pl_bit_encoding_opts[] = {
+#define STRUCT_BASE struct pl_bit_encoding
+    OPT_INT("sample_depth", "Sampled bit depth", sample_depth),
+    OPT_INT("color_depth", "Effective bit depth", color_depth),
+    OPT_INT("bit_shift", "Bit shift", bit_shift),
+    {0},
+#undef STRUCT_BASE
+};
+
+// Note: `prim`, `scene_max`, `scene_avg`, `ootf` and the PQ averages are
+// omitted; they are decoder-provided metadata rather than user settings.
+static const struct pl_opt_t pl_hdr_metadata_opts[] = {
+#define STRUCT_BASE struct pl_hdr_metadata
+    OPT_FLOAT("min_luma", "Black point (cd/m²)", min_luma),
+    OPT_FLOAT("max_luma", "Peak brightness (cd/m²)", max_luma),
+    OPT_FLOAT("max_cll", "Maximum content light level (cd/m²)", max_cll),
+    OPT_FLOAT("max_fall", "Maximum frame average light level (cd/m²)", max_fall),
+    {0},
+#undef STRUCT_BASE
+};
+
+static const struct pl_opt_t pl_vec2df_opts[] = {
+#define STRUCT_BASE pl_vec2df
+    OPT_FLOAT("x", "Horizontal component", x),
+    OPT_FLOAT("y", "Vertical component", y),
+    {0},
+#undef STRUCT_BASE
+};
+
+static const struct pl_opt_t pl_rect2df_opts[] = {
+#define STRUCT_BASE pl_rect2df
+    OPT_FLOAT("x0", "Left edge", x0),
+    OPT_FLOAT("y0", "Top edge", y0),
+    OPT_FLOAT("x1", "Right edge", x1),
+    OPT_FLOAT("y1", "Bottom edge", y1),
+    {0},
+#undef STRUCT_BASE
+};
+
+const struct pl_opt_t pl_color_repr_opts[] = {
+#define STRUCT_BASE struct pl_color_repr
+    OPT_ENUM("sys", "Color system", sys, LIST(
+             {"auto",        PL_COLOR_SYSTEM_UNKNOWN},
+             {"bt.601",      PL_COLOR_SYSTEM_BT_601},
+             {"bt.709",      PL_COLOR_SYSTEM_BT_709},
+             {"smpte-240m",  PL_COLOR_SYSTEM_SMPTE_240M},
+             {"bt.2020-ncl", PL_COLOR_SYSTEM_BT_2020_NC},
+             {"bt.2020-cl",  PL_COLOR_SYSTEM_BT_2020_C},
+             {"bt.2100-pq",  PL_COLOR_SYSTEM_BT_2100_PQ},
+             {"bt.2100-hlg", PL_COLOR_SYSTEM_BT_2100_HLG},
+             {"dolbyvision", PL_COLOR_SYSTEM_DOLBYVISION},
+             {"ycgco",       PL_COLOR_SYSTEM_YCGCO},
+             {"ycgco-re",    PL_COLOR_SYSTEM_YCGCO_RE},
+             {"ycgco-ro",    PL_COLOR_SYSTEM_YCGCO_RO},
+             {"rgb",         PL_COLOR_SYSTEM_RGB},
+             {"xyz",         PL_COLOR_SYSTEM_XYZ})),
+    OPT_ENUM("levels", "Color levels", levels, LIST(
+             {"auto",        PL_COLOR_LEVELS_UNKNOWN},
+             {"limited",     PL_COLOR_LEVELS_LIMITED},
+             {"full",        PL_COLOR_LEVELS_FULL})),
+    OPT_ENUM("alpha", "Alpha mode", alpha, LIST(
+             {"unknown",       PL_ALPHA_UNKNOWN},
+             {"independent",   PL_ALPHA_INDEPENDENT},
+             {"premultiplied", PL_ALPHA_PREMULTIPLIED},
+             {"none",          PL_ALPHA_NONE})),
+    OPT_STRUCT("bits", "Bit encoding", bits, pl_bit_encoding_opts),
+    {0},
+#undef STRUCT_BASE
+};
+
+const struct pl_opt_t pl_color_space_opts[] = {
+#define STRUCT_BASE struct pl_color_space
+    OPT_ENUM("primaries", "Color primaries", primaries, LIST(
+             {"auto",        PL_COLOR_PRIM_UNKNOWN},
+             {"bt.601-525",  PL_COLOR_PRIM_BT_601_525},
+             {"bt.601-625",  PL_COLOR_PRIM_BT_601_625},
+             {"bt.709",      PL_COLOR_PRIM_BT_709},
+             {"bt.470m",     PL_COLOR_PRIM_BT_470M},
+             {"ebu3213",     PL_COLOR_PRIM_EBU_3213},
+             {"bt.2020",     PL_COLOR_PRIM_BT_2020},
+             {"apple",       PL_COLOR_PRIM_APPLE},
+             {"adobe",       PL_COLOR_PRIM_ADOBE},
+             {"prophoto",    PL_COLOR_PRIM_PRO_PHOTO},
+             {"cie1931",     PL_COLOR_PRIM_CIE_1931},
+             {"dci-p3",      PL_COLOR_PRIM_DCI_P3},
+             {"display-p3",  PL_COLOR_PRIM_DISPLAY_P3},
+             {"v-gamut",     PL_COLOR_PRIM_V_GAMUT},
+             {"s-gamut",     PL_COLOR_PRIM_S_GAMUT},
+             {"film-c",      PL_COLOR_PRIM_FILM_C},
+             {"aces-ap0",    PL_COLOR_PRIM_ACES_AP0},
+             {"aces-ap1",    PL_COLOR_PRIM_ACES_AP1})),
+    OPT_ENUM("transfer", "Transfer function", transfer, LIST(
+             {"auto",        PL_COLOR_TRC_UNKNOWN},
+             {"bt.1886",     PL_COLOR_TRC_BT_1886},
+             {"srgb",        PL_COLOR_TRC_SRGB},
+             {"linear",      PL_COLOR_TRC_LINEAR},
+             {"gamma1.8",    PL_COLOR_TRC_GAMMA18},
+             {"gamma2.0",    PL_COLOR_TRC_GAMMA20},
+             {"gamma2.2",    PL_COLOR_TRC_GAMMA22},
+             {"gamma2.4",    PL_COLOR_TRC_GAMMA24},
+             {"gamma2.6",    PL_COLOR_TRC_GAMMA26},
+             {"gamma2.8",    PL_COLOR_TRC_GAMMA28},
+             {"prophoto",    PL_COLOR_TRC_PRO_PHOTO},
+             {"st428",       PL_COLOR_TRC_ST428},
+             {"pq",          PL_COLOR_TRC_PQ},
+             {"hlg",         PL_COLOR_TRC_HLG},
+             {"v-log",       PL_COLOR_TRC_V_LOG},
+             {"s-log1",      PL_COLOR_TRC_S_LOG1},
+             {"s-log2",      PL_COLOR_TRC_S_LOG2},
+             {"scrgb",       PL_COLOR_TRC_SCRGB})),
+    OPT_STRUCT("hdr", "HDR metadata", hdr, pl_hdr_metadata_opts),
+    {0},
+#undef STRUCT_BASE
+};
+
+const struct pl_opt_t pl_input_opts[] = {
+#define STRUCT_BASE struct pl_input_t
+    OPT_DOUBLE("start_pts", "Output PTS at which the input appears", start_pts),
+    OPT_DOUBLE("stop_pts", "Output PTS at which the input disappears", stop_pts),
+    OPT_ENUM("start_mode", "Rounding mode for `start_pts`", start_mode, ROUND_VALUES),
+    OPT_ENUM("stop_mode", "Rounding mode for `stop_pts`", stop_mode, ROUND_VALUES),
+    OPT_DOUBLE("seek_pts", "Input PTS to display at `start_pts`", seek_pts),
+    OPT_STRUCT("repr", "Color representation override", repr, pl_color_repr_opts),
+    OPT_STRUCT("color", "Color space override", color, pl_color_space_opts),
+    OPT_ENUM("chroma_location", "Chroma location override", chroma_location, CHROMA_VALUES),
+    OPT_INT("z_index", "Compositing order", z_index),
+    OPT_INT("rotation", "Extra rotation, in multiples of 90°", rotation),
+    OPT_ENUM("fit", "Image placement mode", fit, LIST(
+             {"contain",    PL_FIT_CONTAIN},
+             {"cover",      PL_FIT_COVER},
+             {"fill",       PL_FIT_FILL},
+             {"scale_down", PL_FIT_SCALE_DOWN},
+             {"place",      PL_FIT_PLACE},
+             {"raw",        PL_FIT_RAW})),
+    OPT_STRUCT("src_rect", "Custom source rectangle", src_rect, pl_rect2df_opts),
+    OPT_STRUCT("dst_rect", "Custom target rectangle", dst_rect, pl_rect2df_opts),
+    OPT_STRUCT("focus", "Focus point", focus, pl_vec2df_opts),
+    {0},
+#undef STRUCT_BASE
+};
+
+const struct pl_opt_t pl_compositor_opts[] = {
+#define STRUCT_BASE struct pl_compositor_t
+    OPT_STRUCT("repr", "Color representation override", repr, pl_color_repr_opts),
+    OPT_STRUCT("color", "Color space override", color, pl_color_space_opts),
+    OPT_ENUM("chroma_location", "Chroma location override", chroma_location, CHROMA_VALUES),
+    {0},
+#undef STRUCT_BASE
+};
+
 pl_opt pl_find_option(const char *key)
 {
-    for (int i = 0; i < pl_option_count; i++) {
-        if (!strcmp(key, pl_option_list[i].key))
-            return &pl_option_list[i];
-    }
-
-    return NULL;
+    return resolve(pl_option_list, pl_str0(key), NULL);
 }

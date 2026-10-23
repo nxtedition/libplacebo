@@ -86,6 +86,18 @@ int main()
                 break;
             }
         }
+
+        // Absolute black stays finite and below a dark gray, also with the
+        // default luminance range of the transfer
+        const struct pl_color_space def = { .transfer = trc };
+        float black[3] = { 0.0f, 0.0f, 0.0f };
+        float gray[3] = { 0.01f, 0.01f, 0.01f };
+        pl_color_delinearize(&def, black);
+        pl_color_delinearize(&def, gray);
+        for (int i = 0; i < 3; i++) {
+            REQUIRE(isfinite(black[i]));
+            REQUIRE_CMP(black[i], <, gray[i], "f");
+        }
     }
 
     // Test scRGB out-of-gamut handling
@@ -160,6 +172,41 @@ int main()
 
     float xyz = pl_color_repr_normalize(&xyz12);
     REQUIRE_FEQ(xyz * (4095 << 4), 65535, 1e-7);
+
+    // XYZ decodes into DCI-P3 by default, or into the requested primaries
+    static const enum pl_color_primaries xyz_prims[] = {
+        PL_COLOR_PRIM_UNKNOWN,
+        PL_COLOR_PRIM_DCI_P3,
+        PL_COLOR_PRIM_BT_2020,
+        PL_COLOR_PRIM_BT_709,
+    };
+
+    for (int i = 0; i < PL_ARRAY_SIZE(xyz_prims); i++) {
+        struct pl_color_repr repr = {
+            .sys    = PL_COLOR_SYSTEM_XYZ,
+            .levels = PL_COLOR_LEVELS_FULL,
+        };
+
+        pl_transform3x3 tr = pl_color_repr_decode_ex(&repr, pl_color_repr_decode_params(
+            .primaries = xyz_prims[i],
+        ));
+
+        enum pl_color_primaries prim = PL_DEF(xyz_prims[i], PL_COLOR_PRIM_DCI_P3);
+        pl_matrix3x3 ref = pl_get_xyz2rgb_matrix(pl_raw_primaries_get(prim));
+        REQUIRE_CMP(repr.sys, ==, PL_COLOR_SYSTEM_RGB, "d");
+        for (int r = 0; r < 3; r++) {
+            for (int c = 0; c < 3; c++)
+                REQUIRE_FEQ(tr.mat.m[r][c], ref.m[r][c], 1e-6);
+            REQUIRE_FEQ(tr.c[r], 0.0, 1e-6);
+        }
+
+        if (!xyz_prims[i]) {
+            // Ensure the legacy entrypoint matches the default
+            repr.sys = PL_COLOR_SYSTEM_XYZ;
+            pl_transform3x3 tr2 = pl_color_repr_decode(&repr, NULL);
+            REQUIRE_MEMEQ(&tr, &tr2, sizeof(tr));
+        }
+    }
 
     // Assume we uploaded a 10-bit source directly (unshifted) as a 16-bit
     // texture. This texture multiplication factor should make it behave as if

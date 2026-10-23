@@ -30,12 +30,12 @@ struct pl_timer_t {
     VkQueryPool qpool; // even=start, odd=stop
     int index_write; // next index to write to
     int index_read; // next index to read from
-    uint64_t pending; // bitmask of queries that are still running
+    atomic_uint_fast8_t pending; // bitmask of queries that are still running
 };
 
-static inline uint64_t timer_bit(int index)
+static inline uint_fast8_t timer_bit(int index)
 {
-    return 1llu << (index / 2);
+    return 1u << (index / 2);
 }
 
 static void timer_destroy_cb(pl_gpu gpu, pl_timer timer)
@@ -43,7 +43,7 @@ static void timer_destroy_cb(pl_gpu gpu, pl_timer timer)
     struct pl_vk *p = PL_PRIV(gpu);
     struct vk_ctx *vk = p->vk;
 
-    pl_assert(!timer->pending);
+    pl_assert(!atomic_load(&timer->pending));
     vk->DestroyQueryPool(vk->dev, timer->qpool, PL_VK_ALLOC);
     pl_free(timer);
 }
@@ -86,7 +86,7 @@ static uint64_t vk_timer_query(pl_gpu gpu, pl_timer timer)
         return 0; // no more unprocessed results
 
     vk_poll_commands(vk, 0);
-    if (timer->pending & timer_bit(timer->index_read))
+    if (atomic_load(&timer->pending) & timer_bit(timer->index_read))
         return 0; // still waiting for results
 
     VkResult res;
@@ -123,7 +123,7 @@ static void timer_begin(pl_gpu gpu, struct vk_cmd *cmd, pl_timer timer)
     }
 
     vk_poll_commands(vk, 0);
-    if (timer->pending & timer_bit(timer->index_write))
+    if (atomic_load(&timer->pending) & timer_bit(timer->index_write))
         return; // next query is still running, skip this timer
 
     VkQueueFlags reset_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
@@ -187,7 +187,7 @@ static void timer_end_cb(void *ptimer, void *pindex)
 {
     pl_timer timer = ptimer;
     int index = (uintptr_t) pindex;
-    timer->pending &= ~timer_bit(index);
+    atomic_fetch_and(&timer->pending, ~timer_bit(index));
 }
 
 bool _end_cmd(pl_gpu gpu, struct vk_cmd **pcmd, bool submit)
@@ -212,7 +212,7 @@ bool _end_cmd(pl_gpu gpu, struct vk_cmd **pcmd, bool submit)
         vk->CmdWriteTimestamp(cmd->buf, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                               timer->qpool, timer->index_write + 1);
 
-        timer->pending |= timer_bit(timer->index_write);
+        atomic_fetch_or(&timer->pending, timer_bit(timer->index_write));
         vk_cmd_callback(cmd, timer_end_cb, timer,
                         (void *) (uintptr_t) timer->index_write);
 
@@ -431,8 +431,13 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
         goto error;
 
     // Query all device properties
+    VkPhysicalDeviceDriverProperties driver_props = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+    };
+
     VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT,
+        .pNext = &driver_props,
     };
 
     VkPhysicalDeviceIDPropertiesKHR id_props = {
@@ -537,7 +542,8 @@ pl_gpu pl_gpu_create_vk(struct vk_ctx *vk)
         .max_buffer_texels  = PL_MIN(limits.maxTexelBufferElements, max_size),
         .align_host_ptr     = host_props.minImportedHostPointerAlignment,
         .host_cached        = vk_malloc_avail(vk->ma, VK_MEMORY_PROPERTY_HOST_CACHED_BIT),
-        .host_ptr_slow      = props.properties.vendorID == VK_VENDOR_ID_NVIDIA,
+        .host_ptr_slow      = driver_props.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
+                              driver_props.driverID == VK_DRIVER_ID_AMD_PROPRIETARY,
         // pl_tex
         .max_tex_1d_dim     = limits.maxImageDimension1D,
         .max_tex_2d_dim     = limits.maxImageDimension2D,

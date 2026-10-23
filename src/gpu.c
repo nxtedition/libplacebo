@@ -430,10 +430,10 @@ void pl_tex_blit(pl_gpu gpu, const struct pl_tex_blit_params *params)
     return;
 
 error:
-    if (src->params.debug_tag || dst->params.debug_tag) {
+    if ((src && src->params.debug_tag) || (dst && dst->params.debug_tag)) {
         PL_ERR(gpu, "  for textures: src %s, dst %s",
-               PL_DEF(src->params.debug_tag, "(unknown)"),
-               PL_DEF(dst->params.debug_tag, "(unknown)"));
+               PL_DEF(src ? src->params.debug_tag : NULL, "(unknown)"),
+               PL_DEF(dst ? dst->params.debug_tag : NULL, "(unknown)"));
     }
 }
 
@@ -995,6 +995,7 @@ static inline void log_shader_sources(pl_log log, enum pl_log_level level,
     pl_unreachable();
 }
 
+#ifndef CI_NO_SHADER_DUMP
 static void log_spec_constants(pl_log log, enum pl_log_level lev,
                                const struct pl_pass_params *params,
                                const void *constant_data)
@@ -1021,6 +1022,7 @@ static void log_spec_constants(pl_log log, enum pl_log_level lev,
         }
     }
 }
+#endif
 
 pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
 {
@@ -1079,8 +1081,10 @@ pl_pass pl_pass_create(pl_gpu gpu, const struct pl_pass_params *params)
     require(params->push_constants_size <= gpu->limits.max_pushc_size);
     require(params->push_constants_size == PL_ALIGN2(params->push_constants_size, 4));
 
+#ifndef CI_NO_SHADER_DUMP
     log_shader_sources(gpu->log, PL_LOG_DEBUG, params);
     log_spec_constants(gpu->log, PL_LOG_DEBUG, params, params->constant_data);
+#endif
 
     const struct pl_gpu_fns *impl = PL_PRIV(gpu);
     pl_pass pass = impl->pass_create(gpu, params);
