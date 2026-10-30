@@ -208,7 +208,8 @@ float pl_color_repr_normalize(struct pl_color_repr *repr)
     if (!tex_bits)
         tex_bits = col_bits = 8;
 
-    if (pl_color_levels_guess(repr) == PL_COLOR_LEVELS_LIMITED) {
+    const bool limited = pl_color_levels_guess(repr) == PL_COLOR_LEVELS_LIMITED;
+    if (limited) {
         // Limit range is always shifted directly
         scale *= (float) (1LL << tex_bits) / (1LL << col_bits);
     } else {
@@ -216,6 +217,29 @@ float pl_color_repr_normalize(struct pl_color_repr *repr)
         scale *= ((1LL << tex_bits) - 1.) / ((1LL << col_bits) - 1.);
     }
 
+    // The result is a signal of the sample depth when limited range, and of
+    // the color depth when full range
+    if (bits->sample_depth || bits->color_depth)
+        bits->sample_depth = limited ? tex_bits : col_bits;
+    bits->color_depth = bits->sample_depth;
+    return scale;
+}
+
+float pl_color_repr_code_scale(struct pl_color_repr *repr, int *out_depth)
+{
+    struct pl_bit_encoding *bits = &repr->bits;
+    int tex_bits = PL_DEF(bits->sample_depth, bits->color_depth);
+    int col_bits = PL_DEF(bits->color_depth, bits->sample_depth);
+    if (!tex_bits)
+        tex_bits = col_bits = 8;
+
+    float scale = ((1LL << tex_bits) - 1.) / (1LL << bits->bit_shift);
+    if (out_depth)
+        *out_depth = col_bits;
+
+    bits->bit_shift = 0;
+    if (bits->sample_depth || bits->color_depth)
+        bits->sample_depth = col_bits;
     bits->color_depth = bits->sample_depth;
     return scale;
 }
@@ -423,7 +447,7 @@ float pl_hdr_rescale(enum pl_hdr_scaling from, enum pl_hdr_scaling to, float x)
     // Convert input to PL_SCALE_RELATIVE
     switch (from) {
     case PL_HDR_PQ:
-        x = powf(x, 1.0f / PQ_M2);
+        x = powf(fminf(x, 1.0f), 1.0f / PQ_M2);
         x = fmaxf(x - PQ_C1, 0.0f) / (PQ_C2 - PQ_C3 * x);
         x = powf(x, 1.0f / PQ_M1);
         x *= 10000.0f;
@@ -655,7 +679,7 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
         MAP3(52.37f/48 * powf(X, 2.6f));
         goto scale_out;
     case PL_COLOR_TRC_PQ:
-        MAP3(powf(X, 1 / PQ_M2));
+        MAP3(powf(fminf(X, 1), 1 / PQ_M2));
         MAP3(fmaxf(X - PQ_C1, 0) / (PQ_C2 - PQ_C3 * X));
         MAP3(10000 / PL_COLOR_SDR_WHITE * powf(X, 1 / PQ_M1));
         goto scale_out;
@@ -1659,11 +1683,15 @@ bool pl_primaries_superset(const struct pl_raw_primaries *a,
 
 bool pl_primaries_valid(const struct pl_raw_primaries *prim)
 {
-    // Test to see if the primaries form a valid triangle (nonzero area)
-    float area = (prim->blue.x - prim->green.x) * (prim->red.y  - prim->green.y)
-               - (prim->red.x  - prim->green.x) * (prim->blue.y - prim->green.y);
+    // The white point must lie strictly inside the triangle spanned by the
+    // primaries, otherwise the RGB<->XYZ matrix is singular. This also rejects
+    // a degenerate triangle, as the three signed areas sum to its area.
+    float d1 = test_point_line(prim->white, prim->red,   prim->green),
+          d2 = test_point_line(prim->white, prim->green, prim->blue),
+          d3 = test_point_line(prim->white, prim->blue,  prim->red);
 
-    return fabs(area) > 1e-6 && test_point_gamut(prim->white, prim);
+    return (d1 >  1e-6f && d2 >  1e-6f && d3 >  1e-6f) ||
+           (d1 < -1e-6f && d2 < -1e-6f && d3 < -1e-6f);
 }
 
 static inline float xy_dist2(struct pl_cie_xy a, struct pl_cie_xy b)
@@ -1931,11 +1959,11 @@ pl_transform3x3 pl_color_repr_decode_ex(struct pl_color_repr *repr,
 
 #ifdef PL_HAVE_DOVI
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION) {
-        // The RPU matrix already includes levels normalization, but in this
-        // case we also have to respect the signalled color offsets
+        // The RPU matrix already includes levels normalization, and the
+        // signalled color offsets are in units of the composed signal
         for (int i = 0; i < 3; i++) {
             mul[i] = 1.0;
-            black[i] = repr->dovi->nonlinear_offset[i] * scale;
+            black[i] = repr->dovi->nonlinear_offset[i];
         }
     } else
 #endif

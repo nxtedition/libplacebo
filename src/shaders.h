@@ -248,8 +248,9 @@ struct pl_dovi_metadata;
 
 // Add the NLQ-decoded enhancement-layer residual to the (already reshaped)
 // base layer. `el_signal` names a no-arg function (typically produced by
-// `sh_subpass`) returning a vec4 whose `.rgb` holds the EL signal at the current
-// output coordinate. No-op if `data` is NULL or `data->nlq_active` is false.
+// `sh_subpass`) returning a vec4 whose `.rgb` holds the EL sample codes at the
+// current output coordinate. No-op if `data` is NULL or `data->nlq_active` is
+// false.
 void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
                          ident_t el_signal);
 
@@ -288,13 +289,23 @@ void *sh_alloc_obj(pl_gpu gpu, pl_shader_obj *ptr,
                    void (*uninit)(pl_gpu gpu, void *priv));
 
 // Initializes a PRNG. The resulting string will directly evaluate to a
-// pseudorandom, uniformly distributed vec3 from [0.0,1.0]. Since this
+// pseudorandom, uniformly distributed vec3 from [0.0,1.0). Since this
 // algorithm works by mutating a state variable, if the user wants to use the
 // resulting PRNG inside a subfunction, they must add an extra `inout prng_t %s`
 // with the contents of `state` to the signature. (Optional)
 //
 // If `temporal` is set, the PRNG will vary across frames.
 ident_t sh_prng(pl_shader sh, bool temporal, ident_t *state);
+
+// Like `pl_shader_dither` and `pl_shader_error_diffusion`, but quantizing to
+// `steps` steps per unit instead of 2^new_depth - 1
+struct pl_dither_params;
+struct pl_error_diffusion_params;
+void sh_dither(pl_shader sh, int new_depth, float steps,
+               pl_shader_obj *dither_state,
+               const struct pl_dither_params *params);
+bool sh_error_diffusion(pl_shader sh, const struct pl_error_diffusion_params *params,
+                        float steps);
 
 // Backing memory type
 enum sh_lut_type {

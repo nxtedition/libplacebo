@@ -18,6 +18,7 @@
 #include <math.h>
 
 #include "common.h"
+#include "colorspace.h"
 #include "filters.h"
 #include "hash.h"
 #include "shaders.h"
@@ -1658,8 +1659,9 @@ static pl_shader sample_el(struct pass_state *pass, const struct pl_frame *el)
     float rlx = lrx >= 1 ? roundf(lrx) : 1.0 / roundf(1.0 / lrx),
           rly = lry >= 1 ? roundf(lry) : 1.0 / roundf(1.0 / lry);
 
+    // The NLQ reads the EL planes as the integer codes they hold
     struct pl_color_repr el_repr = el->repr;
-    float el_scale = pl_color_repr_normalize(&el_repr);
+    float el_scale = pl_color_repr_code_scale(&el_repr, NULL);
 
 #pragma GLSL vec4 color = vec4(0.0), tmp;
 
@@ -1886,7 +1888,10 @@ static bool pass_read_image(struct pass_state *pass)
         }
     }
 
-    int bits = image->repr.bits.sample_depth;
+    // The neutral values are in the units of the normalized signal
+    struct pl_color_repr normalized = image->repr;
+    pl_color_repr_normalize(&normalized);
+    int bits = normalized.bits.sample_depth;
     float out_scale = bits ? (1llu << bits) / ((1llu << bits) - 1.0f) : 1.0f;
     float neutral_luma = 0.0, neutral_chroma = 0.5f * out_scale;
     if (pl_color_levels_guess(&image->repr) == PL_COLOR_LEVELS_LIMITED)
@@ -2493,7 +2498,8 @@ static void pass_convert_colors(struct pass_state *pass)
 
 // Returns true if error diffusion was successfully performed
 static bool pass_error_diffusion(struct pass_state *pass, pl_shader *sh,
-                                 int new_depth, int comps, int out_w, int out_h)
+                                 int new_depth, float steps, int comps,
+                                 int out_w, int out_h)
 {
     const struct pl_render_params *params = pass->params;
     pl_renderer rr = pass->rr;
@@ -2526,7 +2532,7 @@ static bool pass_error_diffusion(struct pass_state *pass, pl_shader *sh,
         goto error;
 
     pl_shader dsh = pl_dispatch_begin(rr->dp);
-    if (!pl_shader_error_diffusion(dsh, &edpars)) {
+    if (!sh_error_diffusion(dsh, &edpars, steps)) {
         pl_dispatch_abort(rr->dp, &dsh);
         goto error;
     }
@@ -3130,11 +3136,28 @@ static bool pass_output_target(struct pass_state *pass)
 
         }
 
+        // The sample grid of the texture, as seen by the shader. Note that
+        // SNORM normalizes to [-1, 1], so we subtract one bit
+        enum pl_fmt_type type = plane->texture->params.format->type;
+        const int sample_depth = PL_DEF(target->repr.bits.sample_depth,
+                                        target->repr.bits.color_depth);
+        const bool snap = sample_depth && type != PL_FMT_FLOAT;
+        float grid = 0.0f;
+        if (snap) {
+            const bool snorm = type == PL_FMT_SNORM;
+            const int bit_shift = target->repr.bits.bit_shift;
+            grid = ((1ull << (sample_depth - snorm)) - 1) /
+                    (float) (1ull << bit_shift);
+        }
+
         // Ignore dithering for > 16-bit outputs by default, since it makes
         // little sense to do so (and probably just adds errors)
         int depth = target->repr.bits.color_depth, applied_dither = 0;
         if (depth && (depth < 16 || params->force_dither)) {
-            if (pass_error_diffusion(pass, &sh, depth, plane->components,
+            // Dither onto the sample grid, which is not 2^depth - 1 steps for
+            // limited range codes in a deeper texture (shifted, not scaled)
+            const float steps = snap ? grid / scale : ldexpf(1.0f, depth) - 1.0f;
+            if (pass_error_diffusion(pass, &sh, depth, steps, plane->components,
                                      rx1 - rx0, ry1 - ry0))
             {
                 applied_dither = depth;
@@ -3142,7 +3165,7 @@ static bool pass_output_target(struct pass_state *pass)
                 struct pl_dither_params dparams = *params->dither_params;
                 if (!params->disable_dither_gamma_correction)
                     dparams.transfer = target->color.transfer;
-                pl_shader_dither(sh, depth, &rr->dither_state, &dparams);
+                sh_dither(sh, depth, steps, &rr->dither_state, &dparams);
                 applied_dither = depth;
             }
         }
@@ -3156,20 +3179,10 @@ static bool pass_output_target(struct pass_state *pass)
             rr->prev_dither = applied_dither;
         }
 
-        enum pl_fmt_type type = plane->texture->params.format->type;
-        const int sample_depth = PL_DEF(target->repr.bits.sample_depth,
-                                        target->repr.bits.color_depth);
-
-        if (sample_depth && type != PL_FMT_FLOAT) {
+        if (snap) {
+            // Snap MSB-aligned formats (e.g. P010) to the sample grid, so the
+            // unused low bits are zero instead of carrying sub-LSB error
             const char *comps = params->blend_params ? "rgb" : "rgba";
-            const int bit_shift = target->repr.bits.bit_shift;
-
-            // Snap MSB-aligned formats (e.g. P010) to the sample grid, so the unused
-            // low bits are zero instead of carrying sub-LSB error. Note that
-            // SNORM normalizes to [-1, 1], so we subtract one bit
-            const bool snorm = plane->texture->params.format->type == PL_FMT_SNORM;
-            const float grid = ((1ull << (sample_depth - snorm)) - 1) /
-                                (float) (1ull << bit_shift);
             GLSL("color.%s = round(color.%s * "$") * "$"; \n",
                  comps, comps, SH_FLOAT(grid / scale), SH_FLOAT(1.0f / grid));
         }

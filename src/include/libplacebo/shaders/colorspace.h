@@ -37,7 +37,8 @@ PL_API_BEGIN
 PL_API void pl_shader_set_alpha(pl_shader sh, struct pl_color_repr *repr,
                                 enum pl_alpha_mode mode);
 
-// Colorspace reshaping for PL_COLOR_SYSTEM_DOLBYVISION. Note that this is done
+// Colorspace reshaping for PL_COLOR_SYSTEM_DOLBYVISION. The input color holds
+// the base layer sample codes divided by 2^BL_bit_depth. Note that this is done
 // automatically by `pl_shader_decode_color` for PL_COLOR_SYSTEM_DOLBYVISION.
 PL_API void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data);
 
@@ -52,7 +53,8 @@ struct pl_color_decode_args {
 
     // Optional sub-shader producing the enhancement-layer. The expected format
     // and output of the shader depends on the EL being used, based on repr.
-    // Currently only Dolby Vision EL is supported.
+    // Currently only Dolby Vision EL is supported, whose shader returns the
+    // EL sample codes as floats.
     pl_shader enhancement_layer;
 
     // The primaries of the RGB color space to decode into. Only relevant for

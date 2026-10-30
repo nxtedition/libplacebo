@@ -60,7 +60,7 @@ static inline void reshape_mmr(pl_shader sh, ident_t mmr, bool single,
 
     assert(min_order <= max_order);
     if (min_order < max_order)
-        GLSL("uint order = uint(coeffs.w); \n");
+        GLSL("int order = int(coeffs.w); \n");
 
     GLSL("vec4 sigX;                            \n"
          "s = coeffs.x;                         \n"
@@ -113,11 +113,12 @@ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0))
         return;
 
-    float offset[3], slope[3], threshold[3];
+    float offset[3], slope[3], threshold[3], hdr_max[3];
     for (int c = 0; c < 3; c++) {
         offset[c] = data->nlq[c].offset;
         slope[c] = data->nlq[c].deadzone_slope;
         threshold[c] = data->nlq[c].deadzone_threshold;
+        hdr_max[c] = data->nlq[c].hdr_in_max;
     }
 
     ident_t off = sh_var(sh, (struct pl_shader_var) {
@@ -132,16 +133,21 @@ void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
         .var  = pl_var_vec3("nlq_threshold"),
         .data = threshold,
     });
+    ident_t mx = sh_var(sh, (struct pl_shader_var) {
+        .var  = pl_var_vec3("nlq_max"),
+        .data = hdr_max,
+    });
 
-    // LINEAR_DZ dequantization. The (2^eld - 1) factor and the -0.5*S
-    // half-pixel correction are pre-folded into slope/threshold by
-    // pl_map_dovi_metadata, so the per-pixel form collapses to:
-    //   residual = sign(el_centered) * (|el_centered| * slope + threshold)
-    // sign(0) == 0 covers the spec's rr==0 carve-out exactly.
+    // LINEAR_DZ dequantization of the EL codes, rounded to integers after
+    // the resampling: rr = 0 gives no residual, otherwise
+    //   residual = sign(rr) * ((|rr| - 0.5) * slope + threshold)
+    // bounded by hdr_in_max
 #pragma GLSL /* sh_dovi_compose_nlq */                                  \
     {                                                                   \
-    vec3 el_centered = $el_signal().rgb - $off;                         \
-    color.rgb += sign(el_centered) * (abs(el_centered) * $slp + $thr);  \
+    vec3 rr = round($el_signal().rgb - $off);                           \
+    vec3 res = sign(rr) * ((abs(rr) - 0.5) * $slp + $thr);              \
+    color.rgb += clamp(res, -$mx, $mx);                                 \
+    color.rgb = clamp(color.rgb, 0.0, 1.0);                             \
     }
 #endif
 }
@@ -152,13 +158,32 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
     if (!sh_require(sh, PL_SHADER_SIG_COLOR, 0, 0) || !data)
         return;
 
+    // Clamp every component to its own pivot range, also for the components
+    // that the MMR mapping of another component reads
+    float lo[3] = {0.0, 0.0, 0.0}, hi[3] = {1.0, 1.0, 1.0};
+    for (int c = 0; c < 3; c++) {
+        const struct pl_reshape_data *comp = &data->comp[c];
+        if (comp->num_pivots) {
+            lo[c] = comp->pivots[0];
+            hi[c] = comp->pivots[comp->num_pivots - 1];
+        }
+    }
+
     sh_describe(sh, "reshaping");
     GLSL("// pl_shader_reshape                  \n"
          "{                                     \n"
          "vec3 sig;                             \n"
          "vec4 coeffs;                          \n"
          "float s;                              \n"
-         "sig = clamp(color.rgb, 0.0, 1.0);     \n");
+         "sig = clamp(color.rgb, "$", "$");     \n",
+         sh_var(sh, (struct pl_shader_var) {
+             .var  = pl_var_vec3("pivot_lo"),
+             .data = lo,
+         }),
+         sh_var(sh, (struct pl_shader_var) {
+             .var  = pl_var_vec3("pivot_hi"),
+             .data = hi,
+         }));
 
     float coeffs_data[8][4];
     float mmr_packed_data[8*6][4];
@@ -298,15 +323,7 @@ void pl_shader_dovi_reshape(pl_shader sh, const struct pl_dovi_metadata *data)
             GLSL("} \n");
         }
 
-        ident_t lo = sh_var(sh, (struct pl_shader_var) {
-            .var = pl_var_float("lo"),
-            .data = &comp->pivots[0],
-        });
-        ident_t hi = sh_var(sh, (struct pl_shader_var) {
-            .var = pl_var_float("hi"),
-            .data = &comp->pivots[comp->num_pivots - 1],
-        });
-        GLSL("color[%d] = clamp(s, "$", "$"); \n", c, lo, hi);
+        GLSL("color[%d] = clamp(s, 0.0, 1.0); \n", c);
     }
 
     GLSL("} \n");
@@ -328,10 +345,12 @@ void pl_shader_decode_color_ex(pl_shader sh,
     GLSL("// pl_shader_decode_color \n"
          "{ \n");
 
-    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
-    {
-        ident_t scale = SH_FLOAT(pl_color_repr_normalize(repr));
-        GLSL("color.rgb *= vec3("$"); \n", scale);
+    if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION) {
+        // The reshaping maps the sample code divided by 2^BL_bit_depth
+        int depth;
+        float scale = pl_color_repr_code_scale(repr, &depth);
+        scale = ldexpf(scale, -depth);
+        GLSL("color.rgb *= vec3("$"); \n", SH_FLOAT(scale));
     }
 
     if (repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
@@ -342,8 +361,11 @@ void pl_shader_decode_color_ex(pl_shader sh,
         repr->dovi && repr->dovi->nlq_active)
     {
         ident_t el = sh_subpass(sh, args->enhancement_layer);
-        if (el)
-            sh_dovi_compose_nlq(sh, repr->dovi, el);
+        if (!el) {
+            SH_FAIL(sh, "Failed merging the enhancement layer shader");
+            return;
+        }
+        sh_dovi_compose_nlq(sh, repr->dovi, el);
     }
 
     enum pl_color_system orig_sys = repr->sys;
@@ -464,7 +486,7 @@ void pl_shader_decode_color_ex(pl_shader sh,
         });
 
         // PQ EOTF
-        GLSL("color.rgb = pow(max(color.rgb, 0.0), vec3(1.0/%f));   \n"
+        GLSL("color.rgb = pow(clamp(color.rgb, 0.0, 1.0), vec3(1.0/%f)); \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)            \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb);     \n"
              "color.rgb = pow(color.rgb, vec3(1.0/%f));             \n",
@@ -733,7 +755,7 @@ void pl_shader_linearize(pl_shader sh, const struct pl_color_space *csp)
         GLSL("color.rgb = vec3(52.37/48.0) * pow(color.rgb, vec3(2.6));\n");
         goto scale_out;
     case PL_COLOR_TRC_PQ:
-        GLSL("color.rgb = pow(color.rgb, vec3(1.0/%f));         \n"
+        GLSL("color.rgb = pow(min(color.rgb, 1.0), vec3(1.0/%f)); \n"
              "color.rgb = max(color.rgb - vec3(%f), 0.0)        \n"
              "             / (vec3(%f) - vec3(%f) * color.rgb); \n"
              "color.rgb = pow(color.rgb, vec3(1.0/%f));         \n"
@@ -1850,9 +1872,9 @@ static void fill_gamut_lut(void *data, const struct sh_lut_params *params)
     pl_assert(lut_params->lut_stride == 3);
     pl_assert(params->comps == 4);
     for (int i = 0; i < lut_size; i++) {
-        out[0] = roundf(in[0] * UINT16_MAX);
-        out[1] = roundf(in[1] * UINT16_MAX + (UINT16_MAX >> 1));
-        out[2] = roundf(in[2] * UINT16_MAX + (UINT16_MAX >> 1));
+        out[0] = PL_CLAMP(roundf(in[0] * UINT16_MAX), 0, UINT16_MAX);
+        out[1] = PL_CLAMP(roundf(in[1] * UINT16_MAX + 32768), 0, UINT16_MAX);
+        out[2] = PL_CLAMP(roundf(in[2] * UINT16_MAX + 32768), 0, UINT16_MAX);
         out[3] = 0;
         in  += 3;
         out += 4;

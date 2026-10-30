@@ -427,9 +427,18 @@ ident_t sh_const(pl_shader sh, struct pl_shader_const sc)
     case PL_VAR_UINT:
         GLSLH("const uint "$" = uint(%u); \n", id, *(unsigned int *) sc.data);
         return id;
-    case PL_VAR_FLOAT:
-        GLSLH("const float "$" = float(%f); \n", id, *(float *) sc.data);
+    case PL_VAR_FLOAT: {
+        // The shortest form of an integral value has no decimal point, which
+        // makes it an int literal, and the lexer limits those to 32 bits
+        char buf[32];
+        int len = pl_str_print_double(buf, sizeof(buf) - 2, *(float *) sc.data);
+        if (!memchr(buf, '.', len) && !memchr(buf, 'e', len)) {
+            buf[len++] = '.';
+            buf[len++] = '0';
+        }
+        GLSLH("const float "$" = float(%.*s); \n", id, len, buf);
         return id;
+    }
     case PL_VAR_INVALID:
     case PL_VAR_TYPE_COUNT:
         break;
@@ -890,6 +899,7 @@ bool sh_require(pl_shader sh, enum pl_shader_sig insig, int w, int h)
     static const char *names[] = {
         [PL_SHADER_SIG_NONE]  = "PL_SHADER_SIG_NONE",
         [PL_SHADER_SIG_COLOR] = "PL_SHADER_SIG_COLOR",
+        [PL_SHADER_SIG_SAMPLER] = "PL_SHADER_SIG_SAMPLER",
     };
 
     // If we require an input, but there is none available - just get it from
@@ -985,7 +995,9 @@ ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
     ident_t randfun = sh_fresh(sh, "rand"),
             state = sh_fresh(sh, "state");
 
-    // Based on pcg3d (http://jcgt.org/published/0009/03/02/)
+    // Based on pcg3d (http://jcgt.org/published/0009/03/02/). The result is
+    // made from the 24 high bits, which a float holds exactly, so that it
+    // stays below 1.0 (the full 32 bits would round up to 1.0 at the top)
     GLSLG("#define prng_t uvec3\n");
     GLSLH("vec3 "$"(inout uvec3 s) {                    \n"
           "    s = 1664525u * s + uvec3(1013904223u);   \n"
@@ -996,7 +1008,7 @@ ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
           "    s.x += s.y * s.z;                        \n"
           "    s.y += s.z * s.x;                        \n"
           "    s.z += s.x * s.y;                        \n"
-          "    return vec3(s) * 1.0/float(0xFFFFFFFFu); \n"
+          "    return vec3(s >> 8u) * (1.0/16777216.0); \n"
           "}                                            \n",
           randfun);
 
