@@ -4,6 +4,7 @@
 #include <libplacebo/vulkan.h>
 #include <libplacebo/shaders/colorspace.h>
 #include <libplacebo/shaders/deinterlacing.h>
+#include <libplacebo/shaders/motion.h>
 #include <libplacebo/shaders/sampling.h>
 
 enum {
@@ -22,16 +23,24 @@ enum {
     // Test configuration
     TEST_MS     = 1000,
     WARMUP_MS   = 500,
+
+    MAX_SRC     = 16,
+
+    // Displacement between neighboring frames of that sequence
+    FRAME_DX    = 6,
+    FRAME_DY    = 3,
 };
 
-static pl_tex create_test_img(pl_gpu gpu)
+// `dx`/`dy` translate the generated image for motion estimation.
+static pl_tex create_test_img(pl_gpu gpu, float dx, float dy)
 {
     pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, COMPS, DEPTH, 32, PL_FMT_CAP_LINEAR);
     REQUIRE(fmt);
 
-    const float xc = (WIDTH  - 1) / 2.0f;
-    const float yc = (HEIGHT - 1) / 2.0f;
-    const float kf = 0.5f / sqrtf(xc * xc + yc * yc);
+    const float xc = (WIDTH  - 1) / 2.0f + dx;
+    const float yc = (HEIGHT - 1) / 2.0f + dy;
+    const float kf = 0.5f / sqrtf(((WIDTH  - 1) / 2.0f) * ((WIDTH  - 1) / 2.0f) +
+                                  ((HEIGHT - 1) / 2.0f) * ((HEIGHT - 1) / 2.0f));
     const float invphi = 0.61803398874989;
     const float freqR = kf * M_PI * 0.2f;
     const float freqG = freqR * invphi;
@@ -69,24 +78,35 @@ struct bench {
                    pl_tex src);
 
     void (*run_tex)(pl_gpu gpu, pl_tex tex);
+
+    // For algorithms that dispatch multiple separate shaders, or perform
+    // a mix of texture allocations and shader dispatches.
+    void (*run_multi)(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                      pl_tex *srcs, int num_src, unsigned long iter);
+
+    // Length of the source sequence handed to `run_multi`. Ignored by the
+    // other benchmarking functions, which only see srcs[0].
+    int num_src;
 };
 
 static void run_bench(pl_gpu gpu, pl_dispatch dp,
-                      pl_shader_obj *state, pl_tex src,
-                      pl_tex fbo, pl_timer timer,
+                      pl_shader_obj *state, pl_tex *srcs, int num_src,
+                      unsigned long iter, pl_tex fbo, pl_timer timer,
                       const struct bench *bench)
 {
     REQUIRE(bench);
-    REQUIRE(bench->run_sh || bench->run_tex);
+    REQUIRE(bench->run_sh || bench->run_tex || bench->run_multi);
     if (bench->run_sh) {
         pl_shader sh = pl_dispatch_begin(dp);
-        bench->run_sh(sh, state, src);
+        bench->run_sh(sh, state, srcs[0]);
 
         pl_dispatch_finish(dp, pl_dispatch_params(
             .shader = &sh,
             .target = fbo,
             .timer = timer,
         ));
+    } else if (bench->run_multi) {
+        bench->run_multi(gpu, dp, state, srcs, num_src, iter);
     } else {
         bench->run_tex(gpu, fbo);
     }
@@ -98,7 +118,14 @@ static void benchmark(pl_gpu gpu, const char *name,
     pl_dispatch dp = pl_dispatch_create(gpu->log, gpu);
     REQUIRE(dp);
     pl_shader_obj state = NULL;
-    pl_tex src = create_test_img(gpu);
+
+    const int num_src = bench->run_multi ? bench->num_src : 1;
+    // A multi-pass benchmark requires at least one pair of frames.
+    REQUIRE(num_src >= (bench->run_multi ? 2 : 1) && num_src <= MAX_SRC);
+
+    pl_tex srcs[MAX_SRC] = {0};
+    for (int i = 0; i < num_src; i++)
+        srcs[i] = create_test_img(gpu, i * FRAME_DX, i * FRAME_DY);
 
     // Create the FBOs
     pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, COMPS, DEPTH, 32,
@@ -123,7 +150,7 @@ static void benchmark(pl_gpu gpu, const char *name,
     }
 
     // Run the benchmark and flush+block once to force shader compilation etc.
-    run_bench(gpu, dp, &state, src, fbos[0], NULL, bench);
+    run_bench(gpu, dp, &state, srcs, num_src, 0, fbos[0], NULL, bench);
     pl_gpu_finish(gpu);
 
     // Perform the actual benchmark
@@ -140,7 +167,8 @@ static void benchmark(pl_gpu gpu, const char *name,
         const int idx = frames % NUM_TEX;
         while (pl_tex_poll(gpu, fbos[idx], UINT64_MAX))
             ; // do nothing
-        run_bench(gpu, dp, &state, src, fbos[idx], start_test ? timer : NULL, bench);
+        run_bench(gpu, dp, &state, srcs, num_src, frames, fbos[idx],
+                  start_test ? timer : NULL, bench);
         pl_gpu_flush(gpu);
         frames++;
 
@@ -155,7 +183,9 @@ static void benchmark(pl_gpu gpu, const char *name,
         if (start_test) {
             if (pl_clock_diff(now, start_test) > TEST_MS * 1e-3)
                 break;
-        } else if (pl_clock_diff(now, start_warmup) > WARMUP_MS * 1e-3) {
+        } else if (pl_clock_diff(now, start_warmup) > WARMUP_MS * 1e-3 &&
+                   frames >= num_src)
+        {
             start_test = now;
             frames_warmup = frames;
         }
@@ -181,7 +211,8 @@ static void benchmark(pl_gpu gpu, const char *name,
     pl_timer_destroy(gpu, &timer);
     pl_shader_obj_destroy(&state);
     pl_dispatch_destroy(&dp);
-    pl_tex_destroy(gpu, &src);
+    for (int i = 0; i < num_src; i++)
+        pl_tex_destroy(gpu, &srcs[i]);
     for (int i = 0; i < NUM_TEX; i++)
         pl_tex_destroy(gpu, &fbos[i]);
 }
@@ -363,6 +394,98 @@ static void bench_bwdif(pl_shader sh, pl_shader_obj *state, pl_tex src)
     ));
 }
 
+// Maintain a frame signature for each frame. Motion estimation invalidates
+// it's cached data upon non-sequential frame signatures between calls.
+static uint64_t motion_sig = 1;
+
+static void run_motion(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                       pl_tex src_a, pl_tex src_b,
+                       enum pl_motion_direction dir,
+                       enum pl_motion_feature features,
+                       const struct pl_motion_estimate_params *params)
+{
+    const uint64_t sig = motion_sig++;
+
+    REQUIRE(pl_motion_estimate(pl_motion_estimate_input(
+        .gpu        = gpu,
+        .dispatch   = dp,
+        .a          = {
+            .tex    = src_a,
+            .sig    = sig,
+            .repr   = pl_color_repr_rgb,
+            .color  = pl_color_space_srgb,
+        },
+        .b          = {
+            .tex    = src_b,
+            .sig    = sig + 1,
+            .repr   = pl_color_repr_rgb,
+            .color  = pl_color_space_srgb,
+        },
+        .direction  = dir,
+        .features   = features,
+        .state      = state,
+    ), params));
+}
+
+// Estimate motion between sequential pairs of frames, resetting the temporal
+// state upon looping, or on every call if `cold`.
+static void run_motion_seq(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                           pl_tex *srcs, int num_src, unsigned long iter,
+                           bool cold, enum pl_motion_direction dir,
+                           enum pl_motion_feature features,
+                           const struct pl_motion_estimate_params *params)
+{
+    const int i = iter % (num_src - 1);
+    if (!i || cold)
+        pl_motion_reset(*state); // no-op while the state is still NULL
+
+    // Nothing is rendered into an FBO, so throttle on the source texture
+    // instead, which was last used `num_src - 1` iterations ago
+    while (pl_tex_poll(gpu, srcs[i + 1], UINT64_MAX))
+        ; // do nothing
+
+    run_motion(gpu, dp, state, srcs[i], srcs[i + 1], dir, features,
+               params);
+}
+
+static void bench_motion(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                         pl_tex *srcs, int num_src, unsigned long iter)
+{
+    run_motion_seq(gpu, dp, state, srcs, num_src, iter, false,
+                   PL_MOTION_FORWARD, 0, NULL);
+}
+
+static void bench_motion_cold(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                              pl_tex *srcs, int num_src, unsigned long iter)
+{
+    run_motion_seq(gpu, dp, state, srcs, num_src, iter, true,
+                   PL_MOTION_FORWARD, 0, NULL);
+}
+
+static void bench_motion_bidir(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                               pl_tex *srcs, int num_src, unsigned long iter)
+{
+    run_motion_seq(gpu, dp, state, srcs, num_src, iter, false,
+                   PL_MOTION_BOTH, 0, NULL);
+}
+
+static void bench_motion_block4(pl_gpu gpu, pl_dispatch dp, pl_shader_obj *state,
+                                pl_tex *srcs, int num_src, unsigned long iter)
+{
+    run_motion_seq(gpu, dp, state, srcs, num_src, iter, false,
+                   PL_MOTION_FORWARD, 0,
+                   pl_motion_estimate_params( .block_size_coarse = 4,
+                                              .block_size_fine = 4 ));
+}
+
+static void bench_motion_global(pl_gpu gpu, pl_dispatch dp,
+                                pl_shader_obj *state, pl_tex *srcs, int num_src,
+                                unsigned long iter)
+{
+    run_motion_seq(gpu, dp, state, srcs, num_src, iter, false,
+                   PL_MOTION_FORWARD, PL_MOTION_GLOBAL, NULL);
+}
+
 static void bench_av1_grain(pl_shader sh, pl_shader_obj *state, pl_tex src)
 {
     struct pl_film_grain_params params = {
@@ -511,8 +634,10 @@ int main()
     if (!vk)
         return SKIP;
 
-#define BENCH_SH(fn)  &(struct bench) { .run_sh = fn }
-#define BENCH_TEX(fn) &(struct bench) { .run_tex = fn }
+#define BENCH_SH(fn)    &(struct bench) { .run_sh = fn }
+#define BENCH_TEX(fn)   &(struct bench) { .run_tex = fn }
+#define BENCH_MULTI(fn) BENCH_MULTI_N(fn, MAX_SRC)
+#define BENCH_MULTI_N(fn, n) &(struct bench) { .run_multi = fn, .num_src = (n) }
 
     printf("= Running benchmarks =\n");
     benchmark(vk->gpu, "tex_download ptr", BENCH_TEX(bench_download));
@@ -558,6 +683,14 @@ int main()
     benchmark(vk->gpu, "h274_grain", BENCH_SH(bench_h274_grain));
     benchmark(vk->gpu, "reshape_poly", BENCH_SH(bench_reshape_poly));
     benchmark(vk->gpu, "reshape_mmr", BENCH_SH(bench_reshape_mmr));
+
+    if (vk->gpu->glsl.compute) {
+        benchmark(vk->gpu, "motion", BENCH_MULTI(bench_motion));
+        benchmark(vk->gpu, "motion_cold", BENCH_MULTI(bench_motion_cold));
+        benchmark(vk->gpu, "motion_bidir", BENCH_MULTI(bench_motion_bidir));
+        benchmark(vk->gpu, "motion_block4", BENCH_MULTI(bench_motion_block4));
+        benchmark(vk->gpu, "motion_global", BENCH_MULTI(bench_motion_global));
+    }
 
     pl_vulkan_destroy(&vk);
     pl_log_destroy(&log);

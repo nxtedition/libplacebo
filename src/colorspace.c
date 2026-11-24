@@ -389,7 +389,7 @@ const char *pl_color_transfer_name(enum pl_color_transfer trc)
 }
 
 // HLG 75% value (scene-referred)
-#define HLG_75 3.17955
+#define HLG_75 3.1795507250520861
 
 float pl_color_transfer_nominal_peak(enum pl_color_transfer trc)
 {
@@ -412,9 +412,9 @@ float pl_color_transfer_nominal_peak(enum pl_color_transfer trc)
     case PL_COLOR_TRC_SCRGB:
     case PL_COLOR_TRC_PQ:       return 10000.0 / PL_COLOR_SDR_WHITE;
     case PL_COLOR_TRC_HLG:      return 12.0 / HLG_75;
-    case PL_COLOR_TRC_V_LOG:    return 46.0855;
-    case PL_COLOR_TRC_S_LOG1:   return 6.52;
-    case PL_COLOR_TRC_S_LOG2:   return 9.212;
+    case PL_COLOR_TRC_V_LOG:    return 46.085527956740347;
+    case PL_COLOR_TRC_S_LOG1:   return 6.5199911877014845;
+    case PL_COLOR_TRC_S_LOG2:   return 9.2121165813330652;
     case PL_COLOR_TRC_COUNT: break;
     }
 
@@ -427,7 +427,7 @@ const struct pl_hdr_metadata pl_hdr_metadata_hdr10 ={
         .red   = {0.708,    0.292},
         .green = {0.170,    0.797},
         .blue  = {0.131,    0.046},
-        .white = {0.31271,  0.32902},
+        .white = {0.3127,   0.3290},
     },
     .min_luma = 0,
     .max_luma = 10000,
@@ -695,8 +695,8 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
                       : 4 * X * X);
         // OOTF
         float luma = coef[0] * color[0] + coef[1] * color[1] + coef[2] * color[2];
-        luma = powf(fmaxf(luma / 12, 0), y - 1);
-        MAP3(luma * X / 12);
+        luma = luma > 0 ? powf(luma / 12, y - 1) : 0;
+        MAP3(csp_max * luma * X / 12);
         goto scale_out;
     }
     case PL_COLOR_TRC_V_LOG:
@@ -704,7 +704,8 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
                          : (X - 0.125f) / 5.6f);
         goto scale_out;
     case PL_COLOR_TRC_S_LOG1:
-        MAP3(powf(10, (X - SLOG_C) / SLOG_A) - SLOG_B);
+        MAP3(X >= SLOG_Q ? powf(10, (X - SLOG_C) / SLOG_A) - SLOG_B
+                         : (X - SLOG_Q) / 5);
         goto scale_out;
     case PL_COLOR_TRC_S_LOG2:
         MAP3(X >= SLOG_Q ? (powf(10, (X - SLOG_C) / SLOG_A) - SLOG_B) / SLOG_K2
@@ -771,7 +772,7 @@ void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
         MAP3(powf(X * 48/52.37f, 1/2.6f));
         return;
     case PL_COLOR_TRC_PRO_PHOTO:
-        MAP3(X >= 0.001953f ? powf(X, 1/1.8f) : 16 * X);
+        MAP3(X >= 0.001953125f ? powf(X, 1/1.8f) : 16 * X);
         return;
     case PL_COLOR_TRC_PQ:
         MAP3(powf(X * PL_COLOR_SDR_WHITE / 10000, PQ_M1));
@@ -785,7 +786,7 @@ void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
         const float *coef = rgb2xyz.m[1];
         // OOTF^-1
         float luma = coef[0] * color[0] + coef[1] * color[1] + coef[2] * color[2];
-        luma = powf(fmaxf(1e-6f, luma / csp_max), (1 - y) / y);
+        luma = luma > 0 ? powf(luma / csp_max, (1 - y) / y) : 0;
         MAP3(12 / csp_max * luma * X);
         // OETF
         MAP3(X > 1 ? HLG_A * logf(X - HLG_B) + HLG_C : 0.5f * sqrtf(X));
@@ -797,10 +798,11 @@ void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
                         : 5.6f * X + 0.125f);
         return;
     case PL_COLOR_TRC_S_LOG1:
-        MAP3(SLOG_A * log10f(X + SLOG_B) + SLOG_C);
+        MAP3(X >= 0 ? SLOG_A * log10f(X + SLOG_B) + SLOG_C
+                    : 5 * X + SLOG_Q);
         return;
     case PL_COLOR_TRC_S_LOG2:
-        MAP3(X >= 0 ? SLOG_A * log10f(SLOG_B * X + SLOG_C)
+        MAP3(X >= 0 ? SLOG_A * log10f(SLOG_K2 * X + SLOG_B) + SLOG_C
                     : SLOG_P * X + SLOG_Q);
         return;
     case PL_COLOR_TRC_SCRGB:
@@ -1474,9 +1476,9 @@ const pl_matrix3x3 pl_ipt_lms2ipt = {{
 
 // Numerically inverted from the matrix above
 const pl_matrix3x3 pl_ipt_ipt2lms = {{
-    { 1.0,  0.0975689,  0.205226 },
-    { 1.0, -0.1138760,  0.133217 },
-    { 1.0,  0.0326151, -0.676887 },
+    { 1.0,  0.097568930514613919,  0.2052264331645916 },
+    { 1.0, -0.11387648547314712,   0.13321715836999806 },
+    { 1.0,  0.032615109917066409, -0.67688718306917931 },
 }};
 
 const struct pl_cone_params pl_vision_normal        = {PL_CONE_NONE, 1.0};
@@ -1822,7 +1824,7 @@ pl_transform3x3 pl_color_repr_decode_ex(struct pl_color_repr *repr,
     switch (repr->sys) {
     case PL_COLOR_SYSTEM_BT_709:     m = luma_coeffs(0.2126, 0.7152, 0.0722); break;
     case PL_COLOR_SYSTEM_BT_601:     m = luma_coeffs(0.2990, 0.5870, 0.1140); break;
-    case PL_COLOR_SYSTEM_SMPTE_240M: m = luma_coeffs(0.2122, 0.7013, 0.0865); break;
+    case PL_COLOR_SYSTEM_SMPTE_240M: m = luma_coeffs(0.2120, 0.7010, 0.0870); break;
     case PL_COLOR_SYSTEM_BT_2020_NC: m = luma_coeffs(0.2627, 0.6780, 0.0593); break;
     case PL_COLOR_SYSTEM_BT_2020_C:
         // Note: This outputs into the [-0.5,0.5] range for chroma information.
@@ -1834,23 +1836,22 @@ pl_transform3x3 pl_color_repr_decode_ex(struct pl_color_repr *repr,
         break;
     case PL_COLOR_SYSTEM_BT_2100_PQ: {
         // Reversed from the matrix in the spec, hard-coded for efficiency
-        // and precision reasons. Exact values truncated from ITU-T H-series
-        // Supplement 18.
-        static const float lm_t = 0.008609, lm_p = 0.111029625;
+        // and precision reasons
+        static const float lm_t = 0.0086090370379327566, lm_p = 0.11102962500302596;
         m = (pl_matrix3x3) {{
             {1.0,  lm_t,  lm_p},
             {1.0, -lm_t, -lm_p},
-            {1.0, 0.560031, -0.320627},
+            {1.0, 0.56003133571067912, -0.32062717498731885},
         }};
         break;
     }
     case PL_COLOR_SYSTEM_BT_2100_HLG: {
-        // Similar to BT.2100 PQ, exact values truncated from WolframAlpha
-        static const float lm_t = 0.01571858011, lm_p = 0.2095810681;
+        // Similar to BT.2100 PQ
+        static const float lm_t = 0.015718580108730413, lm_p = 0.2095810681164055;
         m = (pl_matrix3x3) {{
             {1.0,  lm_t,  lm_p},
             {1.0, -lm_t, -lm_p},
-            {1.0, 1.02127108, -0.605274491},
+            {1.0, 1.0212710798422343, -0.60527449099243151},
         }};
         break;
     }

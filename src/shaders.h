@@ -231,6 +231,7 @@ size_t sh_buf_desc_size(const struct pl_shader_desc *buf_desc);
 #define GLSLF(...) sh_append(sh, SH_BUF_FOOTER, __VA_ARGS__)
 
 // Attach a description to a shader
+void sh_vdescribef(pl_shader sh, const char *fmt, va_list ap);
 void sh_describef(pl_shader sh, const char *fmt, ...)
     PL_PRINTF(2, 3);
 
@@ -254,6 +255,11 @@ struct pl_dovi_metadata;
 void sh_dovi_compose_nlq(pl_shader sh, const struct pl_dovi_metadata *data,
                          ident_t el_signal);
 
+ident_t sh_pq_eotf(pl_shader sh, int comps);
+ident_t sh_pq_eotf_inv(pl_shader sh, int comps);
+ident_t sh_hlg_oetf(pl_shader sh, int comps);
+ident_t sh_hlg_oetf_inv(pl_shader sh, int comps);
+
 // Shader resources
 
 enum pl_shader_obj_type {
@@ -265,6 +271,7 @@ enum pl_shader_obj_type {
     PL_SHADER_OBJ_AV1_GRAIN,
     PL_SHADER_OBJ_FILM_GRAIN,
     PL_SHADER_OBJ_RESHAPE,
+    PL_SHADER_OBJ_MOTION,
 };
 
 struct pl_shader_obj_t {
@@ -288,6 +295,19 @@ void *sh_alloc_obj(pl_gpu gpu, pl_shader_obj *ptr,
                    enum pl_shader_obj_type type, size_t priv_size,
                    void (*uninit)(pl_gpu gpu, void *priv));
 
+// Returns `obj`'s private data, or NULL if `obj` is NULL or of the wrong type.
+// Never creates a new shader, unlike `sh_require_obj`.
+static inline void *sh_lookup_obj(pl_shader_obj obj, enum pl_shader_obj_type type)
+{
+    if (!obj || obj->type != type)
+        return NULL;
+
+    return obj->priv;
+}
+
+#define SH_OBJ_LOOKUP(obj, type, t) \
+    ((t*) sh_lookup_obj(obj, type))
+
 // Initializes a PRNG. The resulting string will directly evaluate to a
 // pseudorandom, uniformly distributed vec3 from [0.0,1.0). Since this
 // algorithm works by mutating a state variable, if the user wants to use the
@@ -296,6 +316,39 @@ void *sh_alloc_obj(pl_gpu gpu, pl_shader_obj *ptr,
 //
 // If `temporal` is set, the PRNG will vary across frames.
 ident_t sh_prng(pl_shader sh, bool temporal, ident_t *state);
+
+// Defines a function returning the median of an array of N values of the
+// float vector type of `mask`, per component, and returns its name.
+//
+// Note: Not all values of N are implemented; see `src/shaders.c` for a list.
+ident_t sh_median(pl_shader sh, const int N, uint8_t comps);
+
+// Defines `void f(ivec2 pos, out T v[bw * bh])` which fills `v` with the
+// `bw x bh` edge-clamped texels of the (pre-bound) texture `tex`, starting
+// from the top-left pixel at `pos`, in row-major order.
+ident_t sh_tex_load_block(pl_shader sh, int bw, int bh, uint8_t comps,
+                          ident_t tex, const struct pl_tex_params *tpars);
+
+// Defines `T f(ivec2 pos)`, returning the components `comps` of the 2x2
+// edge-clamped texels of the (pre-bound) texture `tex`: for each component, a
+// vec4 of its texels in row-major order. `T` is `vec4` for a single component,
+// or else `matNx4`, with a column per component.
+ident_t sh_tex_quad(pl_shader sh, uint8_t comps, ident_t tex,
+                    const struct pl_tex_params *tpars);
+
+// Defines `float f(float ref[bw * bh], vec2 pos, float gain, float limit)`
+// which returns the sum of squared differences between the `bw x bh` block
+// `ref`, in row-major order, and the bilinear samples of the component `comp`
+// of the (pre-bound) texture `tex` starting from `pos` (in texels, with texel
+// centres at integers), scaled by `gain`. Returns early, every two rows, once
+// the sum reaches `limit`.
+ident_t sh_block_ssd(pl_shader sh, int bw, int bh, uint8_t comp, ident_t tex,
+                     const struct pl_tex_params *tpars);
+
+// Defines a function `vec4 fn(vec2 pos)` sampling `tex` (with texels of the
+// size `pt`, bound with linear sampling) with a cubic B-spline, and returns
+// its name.
+ident_t sh_bicubic(pl_shader sh, ident_t tex, ident_t pt, float B);
 
 // Like `pl_shader_dither` and `pl_shader_error_diffusion`, but quantizing to
 // `steps` steps per unit instead of 2^new_depth - 1

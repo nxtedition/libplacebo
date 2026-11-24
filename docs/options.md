@@ -527,7 +527,7 @@ average brightness to the (scaled) target average, while a value of `0.0` never
 modifies scene brightness.
 
 Affects all methods that use the ST2094 knee point determination (currently
-`spline`, `st2094-40` and `st2094-10`). Defaults to `0.4`.
+`spline`, `st2094-40` and `st2094-10`). Defaults to `0.3`.
 
 #### `knee_minimum=<0.0..0.5>`, `knee_maximum=<0.5..1.0>`
 
@@ -563,6 +563,13 @@ shadow/highlight details, while lower values make the curve shallowed (closer
 to `linear`), preserving highlights at the cost of losing midtone contrast.
 Values above `1.0` are possible, resulting in an output with more contrast than
 the input. Defaults to `0.5`.
+
+#### `spline_shoulder=<0.0..1.0>`
+
+Shoulder hardness for the `spline` function. At `0.0` the curve starts to roll
+off right at the knee. Higher values keep it linear for longer above the knee,
+which preserves the brightness of midtones and highlights at the cost of
+gradation near the peak. Defaults to `0.15`.
 
 #### `reinhard_contrast=<0.0..1.0>`
 

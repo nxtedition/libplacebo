@@ -418,6 +418,40 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
             nk_tree_pop(nk);
         }
 
+        if (nk_tree_push(nk, NK_TREE_NODE, "Frame interpolation", NK_MINIMIZED)) {
+            struct pl_frame_interp_params *ipar = &opts->frame_interp_params;
+            struct pl_motion_estimate_params *mpar = &ipar->motion;
+            nk_layout_row_dynamic(nk, 24, 2);
+            par->frame_interp_params = nk_check_label(nk, "Enable", par->frame_interp_params) ? ipar : NULL;
+            if (nk_button_label(nk, "Reset settings"))
+                *ipar = pl_frame_interp_default_params;
+
+            static const char *interp_algos[PL_FRAME_INTERP_ALGO_COUNT] = {
+                [PL_FRAME_INTERP_GLOBAL_MOTION] = "Global motion",
+                [PL_FRAME_INTERP_VISUALIZE]     = "Visualize motion vectors",
+                [PL_FRAME_INTERP_QUALITY]       = "Visualize quality",
+                [PL_FRAME_INTERP_OCCLUSION]     = "Visualize occlusion",
+            };
+
+            nk_label(nk, "Algorithm", NK_TEXT_LEFT);
+            ipar->algo = nk_combo(nk, interp_algos, PL_FRAME_INTERP_ALGO_COUNT,
+                                  ipar->algo, 16, nk_vec2(nk_widget_width(nk), 300));
+
+            nk_label(nk, "Pyramid levels:", NK_TEXT_LEFT);
+            auto_property_int(nk, 0, 0, &mpar->pyramid_levels, 16, 1, 1);
+            nk_property_int(nk, "Coarse block size", 2,
+                            &mpar->block_size_coarse, 64, 2, 2);
+            if (mpar->block_size_fine > mpar->block_size_coarse)
+                mpar->block_size_fine = mpar->block_size_coarse;
+            nk_property_int(nk, "Fine block size", 1, &mpar->block_size_fine,
+                            mpar->block_size_coarse, 1, 1);
+            nk_property_int(nk, "Coarse search radius", 0,
+                            &mpar->search_radius_coarse, 32, 1, 1);
+            nk_property_int(nk, "Fine search radius", 0,
+                            &mpar->search_radius_fine, 32, 1, 1);
+            nk_tree_pop(nk);
+        }
+
         if (nk_tree_push(nk, NK_TREE_NODE, "Deinterlacing", NK_MINIMIZED)) {
             struct pl_deinterlace_params *dpar = &opts->deinterlace_params;
             nk_layout_row_dynamic(nk, 24, 2);
@@ -682,6 +716,7 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                 nk_property_float(nk, "Spline slope tuning", 0.0, &tc->slope_tuning, 10.0, 0.05, 0.001);
                 nk_property_float(nk, "Spline slope offset", 0.0, &tc->slope_offset, 1.0, 0.05, 0.001);
                 nk_property_float(nk, "Spline contrast", 0.0, &tc->spline_contrast, 1.5, 0.05, 0.001);
+                nk_property_float(nk, "Spline shoulder", 0.0, &tc->spline_shoulder, 1.0, 0.05, 0.001);
                 nk_property_float(nk, "Reinhard contrast", 0.0, &tc->reinhard_contrast, 1.0, 0.05, 0.001);
                 nk_property_float(nk, "Linear knee point", 0.0, &tc->linear_knee, 1.0, 0.05, 0.001);
                 nk_property_float(nk, "Linear exposure", 0.0, &tc->exposure, 10.0, 0.05, 0.001);
@@ -1115,6 +1150,11 @@ void update_settings(struct plplay *p, const struct pl_frame *target)
                     for (int i = 0; i < p->num_blend_passes[j]; i++)
                         draw_shader_pass(nk, &p->blend_info[j][i]);
                 }
+
+                nk_layout_row_dynamic(nk, 26, 1);
+                nk_label(nk, "Motion estimation:", NK_TEXT_LEFT);
+                for (int i = 0; i < p->num_motion_passes; i++)
+                    draw_shader_pass(nk, &p->motion_info[i]);
 
                 nk_tree_pop(nk);
             }

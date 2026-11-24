@@ -38,7 +38,7 @@ static const float PQ_M1 = 2610./4096 * 1./4,
 // Common constants for ARIB STD-B67 (HLG)
 static const float HLG_A = 0.17883277,
                    HLG_B = 0.28466892,
-                   HLG_C = 0.55991073,
+                   HLG_C = 0.55991072952956202,
                    HLG_REF = 1000.0 / PL_COLOR_SDR_WHITE;
 
 // Common constants for Panasonic V-Log
@@ -50,8 +50,8 @@ static const float VLOG_B = 0.00873,
 static const float SLOG_A = 0.432699,
                    SLOG_B = 0.037584,
                    SLOG_C = 0.616596 + 0.03,
-                   SLOG_P = 3.538813,
-                   SLOG_Q = 0.030001,
+                   SLOG_P = 3.53881278538813,
+                   SLOG_Q = 0.030001222851889303,
                    SLOG_K2 = 155.0 / 219.0;
 
 // Factor from a texture sample to the integer code it holds, and the depth of

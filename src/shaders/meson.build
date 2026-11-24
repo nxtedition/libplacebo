@@ -9,6 +9,8 @@ shader_sources = [
   'film_grain_h274.c',
   'icc.c',
   'lut.c',
+  'motion.c',
+  'pyramid.c',
   'sampling.c',
 ]
 

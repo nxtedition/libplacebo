@@ -51,6 +51,7 @@ static const struct pl_options_t default_options = {
     .cone_params        = { PL_CONE_NONE, 1.0 },
     .deinterlace_params = { PL_DEINTERLACE_DEFAULTS },
     .distort_params     = { PL_DISTORT_DEFAULTS },
+    .frame_interp_params = { PL_FRAME_INTERP_DEFAULTS },
     .upscaler = {
         .name           = "custom",
         .description    = "Custom upscaler",
@@ -116,6 +117,7 @@ static inline void redirect_params(pl_options opts)
     REDIRECT_PARAMS(cone_params);
     REDIRECT_PARAMS(deinterlace_params);
     REDIRECT_PARAMS(distort_params);
+    REDIRECT_PARAMS(frame_interp_params);
 }
 
 void pl_options_reset(pl_options opts, const struct pl_render_params *preset)
@@ -1132,6 +1134,7 @@ const struct pl_opt_t pl_option_list[] = {
     OPT_FLOAT("slope_tuning", "Spline slope tuning strength", color_map_params.tone_constants.slope_tuning, .max = 10.0f),
     OPT_FLOAT("slope_offset", "Spline slope tuning offset", color_map_params.tone_constants.slope_offset, .max = 1.0f),
     OPT_FLOAT("spline_contrast", "Spline slope contrast", color_map_params.tone_constants.spline_contrast, .max = 1.5f),
+    OPT_FLOAT("spline_shoulder", "Spline shoulder hardness", color_map_params.tone_constants.spline_shoulder, .max = 1.0f),
     OPT_FLOAT("reinhard_contrast", "Reinhard contrast", color_map_params.tone_constants.reinhard_contrast, .max = 1.0f),
     OPT_FLOAT("linear_knee", "Tone mapping linear knee point", color_map_params.tone_constants.linear_knee, .max = 1.0f),
     OPT_FLOAT("exposure", "Tone mapping linear exposure", color_map_params.tone_constants.exposure, .max = 10.0f),
@@ -1257,6 +1260,26 @@ const struct pl_opt_t pl_option_list[] = {
              {"independent",   PL_ALPHA_INDEPENDENT},
              {"premultiplied", PL_ALPHA_PREMULTIPLIED},
              {"none",          PL_ALPHA_NONE})),
+
+    // Frame interpolation
+    OPT_ENABLE_PARAMS("frame_interp", "Enable frame interpolation", frame_interp_params),
+    OPT_PRESET("frame_interp_preset", "Frame interpolation preset", frame_interp_params, LIST(
+               {"default", &pl_frame_interp_default_params})),
+    OPT_ENUM("frame_interp_algo", "Frame interpolation algorithm", frame_interp_params.algo, LIST(
+             {"global_motion",  PL_FRAME_INTERP_GLOBAL_MOTION},
+             {"visualize",      PL_FRAME_INTERP_VISUALIZE},
+             {"quality",        PL_FRAME_INTERP_QUALITY},
+             {"occlusion",      PL_FRAME_INTERP_OCCLUSION})),
+    OPT_INT("motion_block_size_coarse", "Motion estimation block size",
+            frame_interp_params.motion.block_size_coarse, .min = 2, .max = 64),
+    OPT_INT("motion_block_size_fine", "Motion estimation block size (refined)",
+            frame_interp_params.motion.block_size_fine, .min = 1, .max = 64),
+    OPT_INT("motion_pyramid_levels", "Requested motion estimation pyramid levels",
+            frame_interp_params.motion.pyramid_levels, .max = 16),
+    OPT_INT("motion_search_radius_coarse", "Motion estimation search radius",
+            frame_interp_params.motion.search_radius_coarse, .max = 32),
+    OPT_INT("motion_search_radius_fine", "Motion estimation search radius (fine)",
+            frame_interp_params.motion.search_radius_fine, .max = 32),
 
     // Misc renderer settings
     OPT_NAMED("error_diffusion", "Error diffusion kernel", params.error_diffusion,

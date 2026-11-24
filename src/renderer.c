@@ -25,6 +25,7 @@
 #include "dispatch.h"
 
 #include <libplacebo/renderer.h>
+#include <libplacebo/shaders/motion.h>
 
 struct cached_frame {
     uint64_t signature;
@@ -68,6 +69,7 @@ struct pl_renderer_t {
     // Shader resource objects and intermediate textures (FBOs)
     pl_shader_obj tone_map_state;
     pl_shader_obj dither_state;
+    pl_shader_obj motion_state;
     pl_shader_obj grain_state[4];
     pl_shader_obj lut_state[3];
     pl_shader_obj icc_state[2];
@@ -158,6 +160,7 @@ static void renderer_uninit(pl_renderer rr)
     // Free all shader resource objects
     pl_shader_obj_destroy(&rr->tone_map_state);
     pl_shader_obj_destroy(&rr->dither_state);
+    pl_shader_obj_destroy(&rr->motion_state);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->lut_state); i++)
         pl_shader_obj_destroy(&rr->lut_state[i]);
     for (int i = 0; i < PL_ARRAY_SIZE(rr->grain_state); i++)
@@ -226,6 +229,7 @@ void pl_renderer_flush_cache(pl_renderer rr)
     rr->frames.num = 0;
 
     pl_reset_detected_peak(rr->tone_map_state);
+    pl_motion_reset(rr->motion_state);
 }
 
 const struct pl_render_params pl_render_fast_params = { PL_RENDER_DEFAULTS };
@@ -2705,8 +2709,48 @@ static uint8_t plane_comps(const struct pl_plane *plane,
     return comps;
 }
 
+static void encode_target(struct pass_state *pass, pl_shader sh,
+                          struct pl_color_repr *repr, struct img *img)
+{
+    const struct pl_frame *target = &pass->target;
+    pl_renderer rr = pass->rr;
+
+    // If the alpha mode is already applied, don't double-apply it
+    if (img->repr.alpha == repr->alpha || img->comps < 4) {
+        repr->alpha = PL_ALPHA_NONE;
+    } else {
+        // `pl_shader_encode_color` expects independent alpha
+        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+    }
+
+    enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
+    if (lut_type != PL_LUT_CONVERSION) {
+        if (repr->sys == PL_COLOR_SYSTEM_XYZ &&
+            img->color.transfer != PL_COLOR_TRC_LINEAR)
+        {
+            // XYZ is encoded in linear light
+            pl_shader_linearize(sh, &img->color);
+            img->color.transfer = PL_COLOR_TRC_LINEAR;
+        }
+
+        pl_shader_encode_color_ex(sh, pl_color_encode_args(
+            .repr      = repr,
+            .primaries = target->color.primaries,
+        ));
+
+        if (repr->sys == PL_COLOR_SYSTEM_XYZ) {
+            // Apply the target transfer function (e.g. ST 428-1) to the XYZ
+            pl_shader_delinearize(sh, &target->color);
+            img->color.transfer = target->color.transfer;
+        }
+    }
+    if (lut_type == PL_LUT_NATIVE)
+        pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
+}
+
 static void clear_target(struct pass_state *pass, const pl_tex background,
-                         float bg_scale, const struct pl_render_params *params)
+                         const struct img *bg_img,
+                         const struct pl_render_params *params)
 {
     pl_renderer rr = pass->rr;
     const struct pl_frame *target = &pass->target;
@@ -2724,7 +2768,9 @@ static void clear_target(struct pass_state *pass, const pl_tex background,
     case PL_CLEAR_TILES:
         pl_frame_clear_tiles(rr->gpu, target, params->tile_colors, params->tile_size);
         break;
-    case PL_CLEAR_BLUR:
+    case PL_CLEAR_BLUR:;
+        struct pl_color_repr bg_repr = target->repr;
+        const float bg_scale = pl_color_repr_normalize(&bg_repr);
         for (int p = 0; p < target->num_planes; p++) {
             const struct pl_plane *plane = &target->planes[p];
             pl_shader sh = pl_dispatch_begin(rr->dp);
@@ -2748,6 +2794,10 @@ static void clear_target(struct pass_state *pass, const pl_tex background,
                 .tex  = background,
                 .rect = rect,
             ));
+
+            struct pl_color_repr repr = bg_repr;
+            struct img img = *bg_img;
+            encode_target(pass, sh, &repr, &img);
 
             GLSL("color.%s *= vec%d(1.0 / "$"); \n",
                  params->blend_params ? "rgb" : "rgba",
@@ -2820,6 +2870,7 @@ static bool pass_output_target(struct pass_state *pass)
 
     bool need_clear = pl_frame_is_cropped(target);
     pl_tex border_tex = NULL;
+    const struct img border_img = *img;
     if (need_clear && params->border == PL_CLEAR_BLUR &&
         !(rr->errors & PL_RENDER_ERR_BLUR))
     {
@@ -3006,37 +3057,7 @@ static bool pass_output_target(struct pass_state *pass)
     struct pl_color_repr repr = target->repr;
     float scale = pl_color_repr_normalize(&repr);
 
-    // If the alpha mode is already applied, don't double-apply it
-    if (img->repr.alpha == repr.alpha || img->comps < 4) {
-        repr.alpha = PL_ALPHA_NONE;
-    } else {
-        // `pl_shader_encode_color` expects independent alpha
-        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
-    }
-
-    enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
-    if (lut_type != PL_LUT_CONVERSION) {
-        if (repr.sys == PL_COLOR_SYSTEM_XYZ &&
-            img->color.transfer != PL_COLOR_TRC_LINEAR)
-        {
-            // XYZ is encoded in linear light
-            pl_shader_linearize(sh, &img->color);
-            img->color.transfer = PL_COLOR_TRC_LINEAR;
-        }
-
-        pl_shader_encode_color_ex(sh, pl_color_encode_args(
-            .repr      = &repr,
-            .primaries = target->color.primaries,
-        ));
-
-        if (repr.sys == PL_COLOR_SYSTEM_XYZ) {
-            // Apply the target transfer function (e.g. ST 428-1) to the XYZ
-            pl_shader_delinearize(sh, &target->color);
-            img->color.transfer = target->color.transfer;
-        }
-    }
-    if (lut_type == PL_LUT_NATIVE)
-        pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
+    encode_target(pass, sh, &repr, img);
 
     // Rotation handling
     if (pass->rotation % PL_ROTATION_180 == PL_ROTATION_90) {
@@ -3053,7 +3074,7 @@ static bool pass_output_target(struct pass_state *pass)
          flipped_y = dst_rect.y1 < dst_rect.y0;
 
     if (need_clear)
-        clear_target(pass, border_tex, scale, params);
+        clear_target(pass, border_tex, &border_img, params);
 
     for (int p = 0; p < target->num_planes; p++) {
         const struct pl_plane *plane = &target->planes[p];
@@ -3716,7 +3737,7 @@ static bool draw_empty_overlays(pl_renderer rr,
     if (!pass_init(&pass, false))
         return false;
 
-    clear_target(&pass, NULL, 0.0f, params);
+    clear_target(&pass, NULL, NULL, params);
     if (!ptarget->num_overlays)
         goto done;
 
@@ -3924,6 +3945,7 @@ static struct params_info render_params_info(const struct pl_render_params *para
 
     // Clear out fields only relevant to pl_render_image_mix
     CLEAR(params.frame_mixer);
+    CLEAR(params.frame_interp_params);
     CLEAR(params.preserve_mixing_cache);
     CLEAR(params.skip_caching_single_frame);
 
@@ -3954,6 +3976,71 @@ static struct params_info render_params_info(const struct pl_render_params *para
 }
 
 #define MAX_MIX_FRAMES 16
+
+// Do not interpolate two frames that are more `MAX_INTERP_SPAN` frame durations
+// away from each other, as this likely resulted from a seek, dropped frames, or
+// a restart. Fall back to `frame_mixer` in this vsync.
+#define MAX_INTERP_SPAN 3.0
+
+// Find the pair of frames that appear before and after the current vsync. This
+// pair will be used for frame interpolation. `out_t` is a value in [0,1]
+// that represents the time t that this vsync is occurring between the two
+// frames.
+//
+// Returns false if `images` does not contain a frame occurring before and
+// after this vsync, or if that pair can't be interpolated between.
+//
+// Assumes `images->timestamps` is sorted.
+static bool find_interp_pair(const struct pl_frame_mix *images, int *out_a,
+                             int *out_b, float *out_t)
+{
+    int a = -1;
+    for (int i = 0; i < images->num_frames; i++) {
+        if (images->timestamps[i] > 0.0)
+            break;
+        a = i;
+    }
+
+    if (a < 0 || a + 1 >= images->num_frames)
+        return false;
+
+    const double ts_a = images->timestamps[a];
+    const double ts_b = images->timestamps[a + 1];
+    const double frame_duration = ts_b - ts_a;
+    if (frame_duration <= 0.0 || frame_duration > MAX_INTERP_SPAN)
+        return false;
+
+    // A repeated frame has no motion to interpolate, so use `frame_mixer` for
+    // this vsync instead.
+    if (images->signatures[a] == images->signatures[a + 1])
+        return false;
+
+    // `pl_render_image_mix` can't combine frames with different rotations.
+    if (pl_rotation_normalize(images->frames[a]->rotation -
+                              images->frames[a + 1]->rotation))
+        return false;
+
+    *out_a = a;
+    *out_b = a + 1;
+    *out_t = PL_CLAMP(-ts_a / frame_duration, 0.0, 1.0);
+    return true;
+}
+
+// Helper to convert to the frame interpolation input type from a cached_frame.
+static struct pl_motion_estimate_frame interp_frame(const struct cached_frame *f,
+                                                    const struct pl_color_space *mix_csp)
+{
+    struct pl_motion_estimate_frame frame = {
+        .tex   = f->tex,
+        .sig   = f->signature,
+        .repr  = f->repr,
+        .color = f->color,
+    };
+
+    // Ignore differences in HDR metadata, as for frame mixing
+    frame.color.hdr = mix_csp->hdr;
+    return frame;
+}
 
 bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
                          const struct pl_frame *ptarget,
@@ -3994,6 +4081,10 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
     if (!out_w || !out_h)
         goto fallback;
 
+    // Jumped back to when frame interpolation fails late. This sets
+    // PL_RENDER_ERR_FRAME_INTERPOLATION first, so `interp` is false on restart
+    // and the frames are selected for `frame_mixer` instead.
+restart: ;
     int fidx = 0;
     struct cached_frame frames[MAX_MIX_FRAMES];
     float weights[MAX_MIX_FRAMES];
@@ -4020,8 +4111,20 @@ bool pl_render_image_mix(pl_renderer rr, const struct pl_frame_mix *images,
         }
     }
 
+    int interp_a = 0, interp_b = 0;
+    float interp_t = 0.0f;
+    // Check if we are doing interpolation and find the frames we are interpolating
+    // between, and the time t between them that the current frame exists.
+    // Frame interpolation takes precedence over `frame_mixer`, which is only
+    // used as a fallback when there is no pair of frames to interpolate, or
+    // interpolation fails.
+    bool interp = params->frame_interp_params && images->num_frames > 1 &&
+                  !(rr->errors & PL_RENDER_ERR_FRAME_INTERPOLATION) &&
+                  find_interp_pair(images, &interp_a, &interp_b, &interp_t);
+
     // Traverse the input frames and determine/prepare the ones we need
-    bool single_frame = !params->frame_mixer || images->num_frames == 1;
+    bool single_frame = (!interp && !params->frame_mixer) ||
+                        images->num_frames == 1;
 retry:
     for (int i = 0; i < images->num_frames; i++) {
         uint64_t sig = images->signatures[i];
@@ -4046,6 +4149,14 @@ retry:
                 PL_TRACE(rr, "  -> Skipping: no frame mixer");
                 continue;
             }
+
+        } else if (interp) {
+
+            if (!(i == interp_a || i == interp_b)) {
+                PL_TRACE(rr, "  -> Skipping: this frame not relevant to interpolation");
+                continue;
+            }
+            weight = 1.0;
 
         // For backwards compatibility, treat !kernel as oversample
         } else if (!mixer.kernel || mixer.kernel == &pl_filter_function_oversample) {
@@ -4133,6 +4244,11 @@ retry:
                         f->params_hash == par_info.hash &&
                         pl_color_space_equal(&f->color, &target->color) &&
                         pl_icc_profile_equal(&f->profile, &target->profile);
+        } else if (can_reuse && interp) {
+            // Motion estimation and frame interpolation need both frames at
+            // the same size, if frames have resized we need to re-render.
+            can_reuse = f->tex->params.w == out_w &&
+                        f->tex->params.h == out_h;
         }
 
         if (!can_reuse && skip_cache) {
@@ -4262,6 +4378,7 @@ inter_pass_error:
     if (!fidx) {
         pl_assert(!single_frame);
         single_frame = true;
+        interp = false;
         goto retry;
     }
 
@@ -4270,7 +4387,50 @@ inter_pass_error:
     pass.info.count = fidx;
     pl_assert(fidx > 0);
 
+    // With a single frame there is nothing to mix, so we can skip the
+    // linearize/delinearize roundtrip.
+    bool mixing = fidx > 1;
+    bool linear_xyz = target_encodes_linear_xyz(target);
+    struct pl_color_space mix_csp = target->color;
+    if (mixing || linear_xyz)
+        mix_csp.transfer = PL_COLOR_TRC_LINEAR;
+    int comps = 0;
+
     pl_shader sh = pl_dispatch_begin(rr->dp);
+    if (interp) {
+        pl_assert(fidx == 2);
+        struct pass_state motion_pass = {
+            .rr = rr,
+            .params = pass.params,
+            .info.stage = PL_RENDER_STAGE_MOTION,
+        };
+
+        // Attribute the passes dispatched by motion estimation to their own
+        // stage
+        pl_dispatch_callback(rr->dp, &motion_pass, info_callback);
+        bool ok = pl_shader_frame_interp(sh, pl_frame_interp_input(
+            .gpu       = rr->gpu,
+            .dispatch  = rr->dp,
+            .a         = interp_frame(&frames[0], &mix_csp),
+            .b         = interp_frame(&frames[1], &mix_csp),
+            .t         = interp_t,
+            .out_color = mix_csp,
+            .state     = &rr->motion_state,
+        ), params->frame_interp_params);
+        pl_dispatch_callback(rr->dp, &pass, info_callback);
+
+        if (!ok) {
+            PL_ERR(rr, "Could not interpolate frame.. disabling frame "
+                   "interpolation!");
+            rr->errors |= PL_RENDER_ERR_FRAME_INTERPOLATION;
+            pl_dispatch_abort(rr->dp, &sh);
+            goto restart;
+        }
+
+        comps = PL_MAX(frames[0].comps, frames[1].comps);
+        goto mixed;
+    }
+
     sh_describef(sh, "frame mixing (%d frame%s)", fidx, fidx > 1 ? "s" : "");
     sh->output = PL_SHADER_SIG_COLOR;
     sh->output_w = out_w;
@@ -4280,17 +4440,9 @@ inter_pass_error:
          "// pl_render_image_mix        \n"
          "{                             \n");
 
-    // With a single frame there is nothing to mix, so we can skip the
-    // linearize/delinearize roundtrip.
-    bool mixing = fidx > 1;
-    bool linear_xyz = target_encodes_linear_xyz(target);
-    struct pl_color_space mix_csp = target->color;
-    if (mixing || linear_xyz)
-        mix_csp.transfer = PL_COLOR_TRC_LINEAR;
     if (mixing)
         GLSL("vec4 mix_color = vec4(0.0); \n");
 
-    int comps = 0;
     for (int i = 0; i < fidx; i++) {
         const struct pl_tex_params *tpars = &frames[i].tex->params;
 
@@ -4332,6 +4484,7 @@ inter_pass_error:
         GLSL("color = mix_color; \n");
     GLSL("} \n");
 
+mixed:
     // Dispatch this to the destination
     pass.img = (struct img) {
         .sh = sh,
@@ -4558,7 +4711,22 @@ void pl_frame_clear_rgba(pl_gpu gpu, const struct pl_frame *frame,
                 clear[c] = mult * encoded[plane->component_mapping[c]];
         }
 
-        pl_tex_clear(gpu, plane->texture, clear);
+        if (plane->texture->params.blit_dst) {
+            pl_tex_clear(gpu, plane->texture, clear);
+            continue;
+        }
+
+        pl_dispatch dp = pl_gpu_dispatch(gpu);
+        pl_shader sh = pl_dispatch_begin(dp);
+        sh->output = PL_SHADER_SIG_COLOR;
+#pragma GLSL /* pl_frame_clear_rgba */                                  \
+        vec4 color = vec4(${float: clear[0]}, ${float: clear[1]},       \
+                          ${float: clear[2]}, ${float: clear[3]});
+
+        pl_dispatch_finish(dp, pl_dispatch_params(
+            .shader = &sh,
+            .target = plane->texture,
+        ));
     }
 }
 

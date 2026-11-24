@@ -699,11 +699,16 @@ static void pl_shader_tests(pl_gpu gpu)
             epsilon = 1e-5;
             break;
 
-        case PL_COLOR_SYSTEM_BT_2100_PQ:
         case PL_COLOR_SYSTEM_BT_2100_HLG:
-            // These seem to be horrifically noisy and prone to breaking on
-            // edge cases for some reason
-            // TODO: figure out why!
+            // R and B near black come out of the square root segment of HLG,
+            // which turns the float rounding of the decode into up to 5e-4
+            epsilon = 1e-3;
+            break;
+
+        case PL_COLOR_SYSTEM_BT_2100_PQ:
+            // Float evaluation of the ST 2084 curves loses up to 0.1 of signal
+            // near black, where R and B are small differences of large L, M
+            // and S and the curve is steepest
             continue;
 
         default: epsilon = 1e-6; break;
@@ -2674,9 +2679,9 @@ static void dovi_test_metadata(const struct dovi_ref *ref,
     const double pivot = ldexp(1.0, -ref->bl_bit_depth);
 
     const pl_matrix3x3 lms2rgb = {{
-        { 3.06441879, -2.16597676,  0.10155818},
-        {-0.65612108,  1.78554118, -0.12943749},
-        { 0.01736321, -0.04725154,  1.03004253},
+        { 3.064396767855625,    -2.165961226711146,     0.1015574148869036},
+        {-0.65613130540261551,   1.7855694129834121,   -0.12943951030147041},
+        { 0.017360633500538487, -0.047244531564539943,  1.0298894699757705},
     }};
     pl_matrix3x3 rgb2lms = lms2rgb;
     pl_matrix3x3_invert(&rgb2lms);

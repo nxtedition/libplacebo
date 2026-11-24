@@ -623,11 +623,16 @@ size_t sh_buf_desc_size(const struct pl_shader_desc *buf_desc)
     return last->layout.offset + last->layout.size;
 }
 
+void sh_vdescribef(pl_shader sh, const char *fmt, va_list ap)
+{
+    sh_describe(sh, pl_vasprintf(sh->info->tmp, fmt, ap));
+}
+
 void sh_describef(pl_shader sh, const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    sh_describe(sh, pl_vasprintf(sh->info->tmp, fmt, ap));
+    sh_vdescribef(sh, fmt, ap);
     va_end(ap);
 }
 
@@ -1025,4 +1030,236 @@ ident_t sh_prng(pl_shader sh, bool temporal, ident_t *p_state)
     ident_t res = sh_fresh(sh, "RAND");
     GLSLH("#define "$" ("$"("$"))\n", res, randfun, state);
     return res;
+}
+
+ident_t sh_median(pl_shader sh, const int n, uint8_t comps)
+{
+    ident_t sort2 = sh_fresh(sh, "sort2"), median = sh_fresh(sh, "median9");
+
+#pragma GLSLH                                                                   \
+    void $sort2(inout ${vecType: comps} a, inout ${vecType: comps} b)           \
+    {                                                                           \
+        ${vecType: comps} lo = min(a, b);                                       \
+        b = max(a, b);                                                          \
+        a = lo;                                                                 \
+    }                                                                           \
+
+    switch (n) {
+    case 9:
+#pragma GLSLH                                                                   \
+        ${vecType: comps} $median(${vecType: comps} v[9])                       \
+        {                                                                       \
+            $sort2(v[1], v[2]); $sort2(v[4], v[5]); $sort2(v[7], v[8]);         \
+            $sort2(v[0], v[1]); $sort2(v[3], v[4]); $sort2(v[6], v[7]);         \
+            $sort2(v[1], v[2]); $sort2(v[4], v[5]); $sort2(v[7], v[8]);         \
+            $sort2(v[0], v[3]); $sort2(v[5], v[8]); $sort2(v[4], v[7]);         \
+            $sort2(v[3], v[6]); $sort2(v[1], v[4]); $sort2(v[2], v[5]);         \
+            $sort2(v[4], v[7]); $sort2(v[4], v[2]); $sort2(v[6], v[4]);         \
+            $sort2(v[4], v[2]);                                                 \
+            return v[4];                                                        \
+        }
+        break;
+
+    default:
+        SH_FAIL(sh, "Unsupported median filter size: %d", n);
+        return NULL_IDENT;
+    }
+
+    return median;
+}
+
+ident_t sh_tex_load_block(pl_shader sh, int bw, int bh, uint8_t comps,
+                          ident_t tex, const struct pl_tex_params *tpars)
+{
+    ident_t fn = sh_fresh(sh, "tex_load_block");
+
+#pragma GLSLH                                                                   \
+    void $fn(ivec2 pos, out ${vecType: comps} v[${const int: bw * bh}])         \
+    {                                                                           \
+        ivec2 tex_range = ivec2(${const int: tpars->w - 1},                     \
+                                ${const int: tpars->h - 1});                    \
+        for (int i = 0; i < ${const int: bw * bh}; i++) {                       \
+            ivec2 p = pos + ivec2(i % ${const int: bw}, i / ${const int: bw});  \
+            p = clamp(p, ivec2(0), tex_range);                                  \
+            v[i] = texelFetch($tex, p, 0).${swizzle: comps};                    \
+        }                                                                       \
+    }
+
+    return fn;
+}
+
+ident_t sh_tex_quad(pl_shader sh, uint8_t comps, ident_t tex,
+                    const struct pl_tex_params *tpars)
+{
+    static const char * const types[] = { "vec4", "mat2x4", "mat3x4", "mat4" };
+    int comp[4], n = 0;
+    for (int c = 0; c < 4; c++) {
+        if (comps & (1 << c))
+            comp[n++] = c;
+    }
+    pl_assert(n > 0);
+
+    // Gathering from components other than the first requires GLSL 400. Past
+    // two components, fetching each texel once beats a gather per component.
+    const bool gather = tpars->format->gatherable && n <= 2 &&
+                        (comps == 0x1 || sh_glsl(sh).version >= 400);
+    ident_t type = sh_fresh(sh, "quad_t"), fn = sh_fresh(sh, "tex_quad");
+    GLSLH("#define "$" %s\n", type, types[n - 1]);
+
+#pragma GLSLH                                                                   \
+    $type $fn(ivec2 pos)                                                        \
+    {                                                                           \
+        @if (gather) {                                                          \
+            vec2 coord = vec2(pos + 1) * vec2(${const float: 1.0f / tpars->w},  \
+                                              ${const float: 1.0f / tpars->h}); \
+            @if (n == 1) {                                                      \
+                @if (comp[0] == 0) {                                            \
+                    return textureGather($tex, coord).wzxy;                     \
+                @} else {                                                       \
+                    return textureGather($tex, coord,                           \
+                                         ${const int: comp[0]}).wzxy;           \
+                @}                                                              \
+            @} else {                                                           \
+                return $type(                                                   \
+                    textureGather($tex, coord, ${const int: comp[0]}).wzxy,     \
+                    textureGather($tex, coord, ${const int: comp[1]}).wzxy);    \
+            @}                                                                  \
+        @} else {                                                               \
+            ivec2 tex_range = ivec2(${const int: tpars->w - 1},                 \
+                                    ${const int: tpars->h - 1});                \
+            ivec2 p0 = clamp(pos, ivec2(0), tex_range);                         \
+            ivec2 p1 = clamp(pos + 1, ivec2(0), tex_range);                     \
+            ivec2 p10 = ivec2(p1.x, p0.y), p01 = ivec2(p0.x, p1.y);             \
+            ${vecType: comps} t00 = texelFetch($tex, p0,  0).${swizzle: comps}; \
+            ${vecType: comps} t10 = texelFetch($tex, p10, 0).${swizzle: comps}; \
+            ${vecType: comps} t01 = texelFetch($tex, p01, 0).${swizzle: comps}; \
+            ${vecType: comps} t11 = texelFetch($tex, p1,  0).${swizzle: comps}; \
+            @if (n == 1) {                                                      \
+                return vec4(t00, t10, t01, t11);                                \
+            @} else {                                                           \
+                $type q;                                                        \
+                @for (c < n)                                                    \
+                    q[@c] = vec4(t00[@c], t10[@c], t01[@c], t11[@c]);           \
+                return q;                                                       \
+            @}                                                                  \
+        @}                                                                      \
+    }
+
+    return fn;
+}
+
+// Defines `void f(ivec2 pos, float fx, out float top[n], out float bot[n])`
+// which fills `top` and `bot` with `n` edge-clamped texels of the rows `pos.y`
+// and `pos.y + 1` of the component `comp` of the (pre-bound) texture `tex`,
+// starting from `pos.x`, each linearly interpolated with its right neighbour
+// by `fx`.
+static ident_t sh_tex_rows(pl_shader sh, int n, uint8_t comp, ident_t tex,
+                           const struct pl_tex_params *tpars)
+{
+    ident_t quad = sh_tex_quad(sh, 1 << comp, tex, tpars);
+    ident_t fn = sh_fresh(sh, "tex_rows");
+    const int quads = n / 2 + 1;
+
+#pragma GLSLH                                                                   \
+    void $fn(ivec2 pos, float fx, out float top[${const int: n}],               \
+             out float bot[${const int: n}])                                    \
+    {                                                                           \
+        vec4 q[${const int: quads}];                                            \
+        @for (i < quads)                                                        \
+            q[@i] = $quad(pos + ivec2(@i * 2, 0));                              \
+        @for (x < n) {                                                          \
+            top[@x] = mix(q[@x / 2][@x % 2],                                    \
+                          q[(@x + 1) / 2][(@x + 1) % 2], fx);                   \
+            bot[@x] = mix(q[@x / 2][@x % 2 + 2],                                \
+                          q[(@x + 1) / 2][(@x + 1) % 2 + 2], fx);               \
+        @}                                                                      \
+    }
+
+    return fn;
+}
+
+ident_t sh_block_ssd(pl_shader sh, int bw, int bh, uint8_t comp, ident_t tex,
+                     const struct pl_tex_params *tpars)
+{
+    ident_t rows = sh_tex_rows(sh, bw, comp, tex, tpars);
+    ident_t fn = sh_fresh(sh, "block_ssd");
+
+#pragma GLSLH                                                                   \
+    float $fn(float ref[${const int: bw * bh}], vec2 pos, float gain,           \
+              float limit)                                                      \
+    {                                                                           \
+        /* The samples share the fraction of `pos`: interpolate them from the   \
+         * texels under them, fetched two rows at a time. */                    \
+        vec2 fl = floor(pos), fr = pos - fl;                                    \
+        float top[${const int: bw}], bot[${const int: bw}];                     \
+        float prev[${const int: bw}];                                           \
+        float ssd = 0.0, d;                                                     \
+        @for (y < bh) {                                                         \
+            @if @(y % 2 == 0) {                                                 \
+                @if @(y == 0)                                                   \
+                    $rows(ivec2(fl), fr.x, top, bot);                           \
+                @for (x < bw) {                                                 \
+                    d = ref[@y * ${const int: bw} + @x]                         \
+                      - gain * mix(top[@x], bot[@x], fr.y);                     \
+                    ssd += d * d;                                               \
+                @}                                                              \
+            @} else {                                                           \
+                prev = bot;                                                     \
+                $rows(ivec2(fl) + ivec2(0, @y + 1), fr.x, top, bot);            \
+                @for (x < bw) {                                                 \
+                    d = ref[@y * ${const int: bw} + @x]                         \
+                      - gain * mix(prev[@x], top[@x], fr.y);                    \
+                    ssd += d * d;                                               \
+                @}                                                              \
+                if (ssd >= limit)                                               \
+                    return ssd;                                                 \
+            @}                                                                  \
+        @}                                                                      \
+        return ssd;                                                             \
+    }
+
+    return fn;
+}
+
+ident_t sh_bicubic(pl_shader sh, ident_t tex, ident_t pt, float B)
+{
+    ident_t fn = sh_fresh(sh, "bicubic");
+
+    // Explanation of how bicubic scaling with only 4 texel fetches is done:
+    //   http://www.mate.tue.nl/mate/pdfs/10318.pdf
+    //   'Efficient GPU-Based Texture Interpolation using Uniform B-Splines'
+#pragma GLSLH                                       \
+    vec4 $fn(vec2 pos)                              \
+    {                                               \
+    const float k0 = ${const float: B / 6};         \
+    const float k1 = ${const float: 1 - B / 3};     \
+    const float k2 = ${const float: 2 * B - 3};     \
+    const float k3 = ${const float: 2 - 1.5f * B};  \
+    vec2 size = vec2(textureSize($tex, 0));         \
+    vec2 f  = fract(pos * size + vec2(0.5));        \
+    vec2 f2 = f * f;                                \
+    vec2 f3 = f2 * f;                               \
+    vec2 g  = vec2(1.0) - f;                        \
+    vec2 g2 = g * g;                                \
+    vec2 g3 = g2 * g;                               \
+    /* compute filter weights directly */           \
+    vec2 w0 = k0 * g3;                              \
+    vec2 w1 = k1 + k2 * f2 + k3 * f3;               \
+    vec2 w2 = k1 + k2 * g2 + k3 * g3;               \
+    vec2 w3 = k0 * f3;                              \
+    vec4 s = vec4(w0 + w1, w2 + w3);                \
+    vec4 o = vec4(w1, w3) / s + g.xyxy;             \
+    o.xy -= vec2(2.0);                              \
+    /* sample four corners, then interpolate */     \
+    vec4 p = pos.xyxy + $pt.xyxy * o;               \
+    vec4 c00 = textureLod($tex, p.xy, 0.0);         \
+    vec4 c01 = textureLod($tex, p.xw, 0.0);         \
+    vec4 c0 = mix(c01, c00, s.y);                   \
+    vec4 c10 = textureLod($tex, p.zy, 0.0);         \
+    vec4 c11 = textureLod($tex, p.zw, 0.0);         \
+    vec4 c1 = mix(c11, c10, s.y);                   \
+    return mix(c1, c0, s.x);                        \
+    }
+
+    return fn;
 }
