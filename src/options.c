@@ -1280,6 +1280,8 @@ const struct pl_opt_t pl_option_list[] = {
             frame_interp_params.motion.search_radius_coarse, .max = 32),
     OPT_INT("motion_search_radius_fine", "Motion estimation search radius (fine)",
             frame_interp_params.motion.search_radius_fine, .max = 32),
+    OPT_FLOAT("motion_fill_threshold", "Motion estimation occlusion fill threshold",
+              frame_interp_params.motion.fill_threshold, .max = 1.0),
 
     // Misc renderer settings
     OPT_NAMED("error_diffusion", "Error diffusion kernel", params.error_diffusion,

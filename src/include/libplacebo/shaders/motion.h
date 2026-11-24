@@ -68,6 +68,12 @@ struct pl_motion_estimate_params {
     // level to detect large motion. If `pyramid_levels` == 1, we use `search_radius_fine` on the only image pyramid level.
     int search_radius_coarse;
     int search_radius_fine;
+
+    // With PL_MOTION_OCCLUSION, vectors whose visibility (1 - occlusion, see
+    // pl_motion_get_occlusion) is below this threshold are blended with those
+    // of more visible content around them. Must be in the range [0, 1]. 0.0
+    // disables this.
+    float fill_threshold;
 };
 
 #define PL_MOTION_ESTIMATE_DEFAULTS                                            \
@@ -75,7 +81,8 @@ struct pl_motion_estimate_params {
     .block_size_fine        = 1,                                               \
     .pyramid_levels         = 0,                                               \
     .search_radius_coarse   = 4,                                               \
-    .search_radius_fine     = 1,
+    .search_radius_fine     = 1,                                               \
+    .fill_threshold         = 0.25,
 
 #define pl_motion_estimate_params(...)                                         \
     (&(struct pl_motion_estimate_params) {                                     \
