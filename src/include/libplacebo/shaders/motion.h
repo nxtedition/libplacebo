@@ -89,7 +89,7 @@ struct pl_motion_estimate_params {
     .block_size_coarse      = 8,                                               \
     .block_size_fine        = 1,                                               \
     .pyramid_levels         = 0,                                               \
-    .search_radius_coarse   = 4,                                               \
+    .search_radius_coarse   = 8,                                               \
     .search_radius_fine     = 1,                                               \
     .fill_threshold         = 0.25,                                            \
     .scale                  = 0.5,
