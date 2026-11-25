@@ -92,6 +92,7 @@ struct sh_motion_obj {
     struct {
         pl_tex_pyramid raw;   // Raw motion vectors (before smoothing)
         pl_buf hist;          // Histogram for global motion estimation
+        pl_tex quality;       // Quality before the median
     } scratch;
 
     // --- Other cached / persistent GPU objects
@@ -571,6 +572,7 @@ static void motion_uninit(pl_gpu gpu, void *ptr)
 {
     struct sh_motion_obj *obj = ptr;
     pl_pyramid_destroy(gpu, &obj->scratch.raw);
+    pl_tex_destroy(gpu, &obj->scratch.quality);
     for (enum dir d = 0; d < NUM_DIRS; d++) {
         pl_pyramid_destroy(gpu, &obj->dir[d].input);
         pl_pyramid_destroy(gpu, &obj->dir[d].coarse);
@@ -2148,13 +2150,13 @@ static bool motion_fill_pass(pl_dispatch dispatch,
 // A mismatch means less the more texture the window has, so it is taken
 // relative to that.
 static bool motion_quality_pass(pl_dispatch dispatch,
-                                const struct sh_motion_obj *obj, enum dir d)
+                                const struct sh_motion_obj *obj, enum dir d,
+                                pl_tex out_tex)
 {
     const struct motion_dir *dir = &obj->dir[d];
     pl_tex prev_tex = pl_pyramid_base(dir->input);
     pl_tex next_tex = pl_pyramid_base(obj->dir[!d].input);
     pl_tex flow_tex = output_flow(dir);
-    pl_tex out_tex = dir->quality;
     pl_buf gain_buf = dir->gain;
 
     const int bs = obj->params.block_size_fine;
@@ -2529,6 +2531,42 @@ static bool scale_output(pl_gpu gpu, pl_dispatch dispatch,
     return true;
 }
 
+// Writes the median of the 3x3 texels around each texel of the quality field
+// `src` into `dst`. Single squares of a quality unlike that around them are
+// noise of the estimate, and would show as speckles in whatever is decided by
+// it.
+static bool motion_quality_median_pass(pl_dispatch dispatch, pl_tex src_tex,
+                                       pl_tex dst_tex)
+{
+    const int w = dst_tex->params.w, h = dst_tex->params.h;
+
+    pl_shader sh = pass_begin(dispatch, 16, 16, 0,
+                              "motion vector quality median (%dx%d)", w, h);
+    if (!sh)
+        return false;
+
+    ident_t src = bind_tex(sh, "quality_in", src_tex);
+    ident_t dst = bind_img(sh, "quality_out", dst_tex);
+    ident_t load_block = sh_tex_load_block(sh, 3, 3, 0x1, src, &src_tex->params);
+    ident_t median9 = sh_median(sh, 9, 0x1);
+
+    // clang-format off
+#pragma GLSL /* motion_quality_median_pass */                                   \
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);                                \
+    if (all(lessThan(pos, ivec2(${const int: w}, ${const int: h})))) {          \
+        float q[9];                                                             \
+        $load_block(pos - 1, q);                                                \
+        imageStore($dst, pos, vec4($median9(q), 0.0, 0.0, 0.0));                \
+    }
+    // clang-format on
+
+    return pl_dispatch_compute(dispatch, pl_dispatch_compute_params(
+        .shader = &sh,
+        .width  = w,
+        .height = h,
+    ));
+}
+
 // Estimates the quality of the vectors of every direction in
 // `obj->valid`, from the luma of the frames they were estimated between.
 static bool estimate_quality(pl_dispatch dispatch,
@@ -2537,7 +2575,10 @@ static bool estimate_quality(pl_dispatch dispatch,
     for (enum dir d = 0; d < NUM_DIRS; d++) {
         if (!(obj->valid & (1 << d)))
             continue;
-        if (!motion_quality_pass(dispatch, obj, d))
+        bool ok = motion_quality_pass(dispatch, obj, d, obj->scratch.quality) &&
+                  motion_quality_median_pass(dispatch, obj->scratch.quality,
+                                             obj->dir[d].quality);
+        if (!ok)
             return false;
     }
 
@@ -2734,6 +2775,19 @@ static bool motion_setup(pl_gpu gpu, struct sh_motion_obj *obj, int w, int h,
                             "texture!", qw, qh);
                 goto error;
             }
+        }
+
+        bool ok = pl_tex_recreate(gpu, &obj->scratch.quality, pl_tex_params(
+            .w          = qw,
+            .h          = qh,
+            .format     = qfmt,
+            .sampleable = true,
+            .storable   = true,
+        ));
+        if (!ok) {
+            PL_ERR(gpu, "pl_motion_estimate: failed creating %dx%d quality "
+                        "texture!", qw, qh);
+            goto error;
         }
     }
 
