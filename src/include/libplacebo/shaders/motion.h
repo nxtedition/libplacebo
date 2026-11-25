@@ -68,14 +68,31 @@ struct pl_motion_estimate_params {
     // level to detect large motion. If `pyramid_levels` == 1, we use `search_radius_fine` on the only image pyramid level.
     int search_radius_coarse;
     int search_radius_fine;
+
+    // With PL_MOTION_OCCLUSION, vectors whose visibility (1 - occlusion, see
+    // pl_motion_get_occlusion) is below this threshold are blended with those
+    // of more visible content around them. Must be in the range [0, 1]. 0.0
+    // disables this.
+    float fill_threshold;
+
+    // Scale, relative to the frames, to estimate the motion at. Must be in the
+    // range (0, 1]. Lower values trade the detail of the flow fields for
+    // speed. Frames that were upscaled hold no more detail than their source,
+    // so their motion is found as well at the resolution of the source. The
+    // frames are sampled bilinearly, so this should not go below half of the
+    // resolution they hold detail at. The vectors remain in pixels of the
+    // frames.
+    float scale;
 };
 
 #define PL_MOTION_ESTIMATE_DEFAULTS                                            \
     .block_size_coarse      = 8,                                               \
     .block_size_fine        = 1,                                               \
     .pyramid_levels         = 0,                                               \
-    .search_radius_coarse   = 4,                                               \
-    .search_radius_fine     = 1,
+    .search_radius_coarse   = 8,                                               \
+    .search_radius_fine     = 1,                                               \
+    .fill_threshold         = 0.25,                                            \
+    .scale                  = 0.5,
 
 #define pl_motion_estimate_params(...)                                         \
     (&(struct pl_motion_estimate_params) {                                     \
@@ -85,7 +102,8 @@ PL_API extern const struct pl_motion_estimate_params
     pl_motion_estimate_default_params;
 
 // Returns the number of blocks `pl_motion_estimate` searches at full
-// resolution, for frames of dimensions `w` x `h`. Purely informative.
+// resolution, for frames of dimensions `w` x `h` (after applying any
+// `pl_motion_estimate_params.scale`). Purely informative.
 PL_API int pl_motion_num_blocks(int w, int h,
                                 const struct pl_motion_estimate_params *params);
 
@@ -150,8 +168,9 @@ PL_API void pl_motion_reset(pl_shader_obj state);
 //
 // This texture may have a size that differs from the inputs themselves.
 // However, the granularity is guaranteed to lie somewhere in the range
-// [block_size_fine, block_size_coarse]. `tex->params` provides the exact
-// dimensions and format.
+// [block_size_fine, block_size_coarse], in pixels of the resolution the motion
+// was estimated at (see `pl_motion_estimate_params.scale`). `tex->params`
+// provides the exact dimensions and format.
 PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
                                  enum pl_motion_direction dir);
 
@@ -160,7 +179,6 @@ PL_API pl_tex pl_motion_get_flow(pl_shader_obj state,
 //
 // This is a single component UNORM texture in the range [0, 1], with a value
 // of 1.0 corresponding to high quality and 0.0 meaning low quality vectors.
-// With PL_MOTION_OCCLUSION, occluded vectors have a lowered quality.
 //
 // See pl_motion_get_flow(), PL_MOTION_QUALITY.
 PL_API pl_tex pl_motion_get_quality(pl_shader_obj state,
@@ -204,10 +222,14 @@ PL_API bool pl_motion_get_global(pl_shader_obj state,
 
 // Algorithm used for frame interpolation when enabled.
 enum pl_frame_interp_algo {
+    // Every pixel is gathered from both frames, along the motion vectors
+    // estimated locally at its position.
+    PL_FRAME_INTERP_GATHER = 0,
+
     // A naive frame mixing algorithm that simply samples from the source
     // frames, offset by the global motion vector. Should be avoided for
     // anything except static pans.
-    PL_FRAME_INTERP_GLOBAL_MOTION = 0,
+    PL_FRAME_INTERP_GLOBAL_MOTION,
 
     // --- Debugging aids to visualize the flow field and metadata
 
@@ -231,11 +253,28 @@ struct pl_frame_interp_params {
 
     // Motion estimation parameters to use for this frame pair.
     struct pl_motion_estimate_params motion;
+
+    // --- PL_FRAME_INTERP_GATHER only
+
+    // When a pixel's motion vector is low quality, fall back to a regular
+    // in-place temporal mix. Setting this higher trades artefacts for
+    // blurriness or stutter. The default of 0.5 provides a reasonable visual
+    // balance.
+    //
+    // Lower values maximize PSNR and visual smoothness, but result in the
+    // most motion artefacts.
+    float gather_mix_blend;
+
+    // If true, sample the frames with bicubic interpolation rather than
+    // faster bilinear interpolation. Sharper but slower.
+    bool bicubic;
 };
 
 #define PL_FRAME_INTERP_DEFAULTS                                               \
-    .algo = PL_FRAME_INTERP_GLOBAL_MOTION,                                     \
-    .motion = {PL_MOTION_ESTIMATE_DEFAULTS},
+    .algo = PL_FRAME_INTERP_GATHER,                                            \
+    .motion = {PL_MOTION_ESTIMATE_DEFAULTS},                                   \
+    .gather_mix_blend = 0.5f,                                                  \
+    .bicubic = true,
 
 #define pl_frame_interp_params(...)                                            \
     (&(struct pl_frame_interp_params) {PL_FRAME_INTERP_DEFAULTS __VA_ARGS__})

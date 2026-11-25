@@ -12,6 +12,11 @@ project('libplacebo', ['c', 'cpp'],
     7,
     # API version
     {
+      '406': 'add pl_motion_estimate_params.scale',
+      '405': 'add pl_frame_interp_params.bicubic',
+      '404': 'add pl_frame_interp_params.gather_mix_blend',
+      '403': 'add pl_frame_interp_algo PL_FRAME_INTERP_GATHER',
+      '402': 'add pl_motion_estimate_params.fill_threshold',
       '401': 'add PL_MOTION_OCCLUSION, pl_motion_get_occlusion and PL_FRAME_INTERP_OCCLUSION',
       '400': 'add pl_tone_map_constants.spline_shoulder',
       '399': 'add pl_opengl_swapchain_params.recreate_surface',

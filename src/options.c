@@ -1266,10 +1266,15 @@ const struct pl_opt_t pl_option_list[] = {
     OPT_PRESET("frame_interp_preset", "Frame interpolation preset", frame_interp_params, LIST(
                {"default", &pl_frame_interp_default_params})),
     OPT_ENUM("frame_interp_algo", "Frame interpolation algorithm", frame_interp_params.algo, LIST(
+             {"gather",         PL_FRAME_INTERP_GATHER},
              {"global_motion",  PL_FRAME_INTERP_GLOBAL_MOTION},
              {"visualize",      PL_FRAME_INTERP_VISUALIZE},
              {"quality",        PL_FRAME_INTERP_QUALITY},
              {"occlusion",      PL_FRAME_INTERP_OCCLUSION})),
+    OPT_FLOAT("gather_mix_blend", "Gather mix fallback blend",
+              frame_interp_params.gather_mix_blend, .max = 1.0),
+    OPT_BOOL("frame_interp_bicubic", "Frame interpolation bicubic interpolation",
+             frame_interp_params.bicubic),
     OPT_INT("motion_block_size_coarse", "Motion estimation block size",
             frame_interp_params.motion.block_size_coarse, .min = 2, .max = 64),
     OPT_INT("motion_block_size_fine", "Motion estimation block size (refined)",
@@ -1280,6 +1285,10 @@ const struct pl_opt_t pl_option_list[] = {
             frame_interp_params.motion.search_radius_coarse, .max = 32),
     OPT_INT("motion_search_radius_fine", "Motion estimation search radius (fine)",
             frame_interp_params.motion.search_radius_fine, .max = 32),
+    OPT_FLOAT("motion_fill_threshold", "Motion estimation occlusion fill threshold",
+              frame_interp_params.motion.fill_threshold, .max = 1.0),
+    OPT_FLOAT("motion_scale", "Motion estimation resolution scale",
+              frame_interp_params.motion.scale, .min = 0.1, .max = 1.0),
 
     // Misc renderer settings
     OPT_NAMED("error_diffusion", "Error diffusion kernel", params.error_diffusion,
